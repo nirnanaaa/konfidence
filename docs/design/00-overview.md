@@ -8,9 +8,9 @@ the landscape's signed delivery (all its slots) plus the blobs the bridge
 lacks, over gRPC, or as a file and CTF. Every rollout status is a function
 of the slots and the bridge's newest signed statement.
 
-![Konfidence architecture: control plane, attached and isolated landscapes](architecture.drawio.svg)
+![Konfidence architecture: control plane, attached and isolated landscapes](architecture.drawio.png)
 
-The diagram source is embedded in the SVG; open it in draw.io to edit.
+Edit the diagram by opening `architecture.drawio.svg` or this PNG in draw.io; both embed the source.
 
 This page holds the vision, the boundary against the vector runtime, the
 three runtime contracts and the glossary. Names live in
