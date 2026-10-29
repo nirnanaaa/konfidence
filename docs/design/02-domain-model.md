@@ -1,149 +1,107 @@
-# Domain model
+# Domain model and name registry
 
-This page is the authoritative resource model of the konfidence deployment
-orchestrator. It defines every custom resource in the control-plane group
-`konfidence.cloud` and the bridge group `landscape.konfidence.cloud`: purpose,
-writer, scope, the fields other docs rely on, and lifecycle. It also lists the
-main Postgres tables. Other docs defer to this page for field names. How
-controllers, workers and the bridge act on these resources lives in the topic
-docs linked per section.
+This page is the only definition of the names other docs depend on (D-API-06):
+every CRD and its fields, every status enum and reason, the Postgres tables
+and the `LISTEN/NOTIFY` channel. Topic docs link here and carry no YAML of
+their own. A name not on this page does not exist yet; add it here first.
+River job kinds belong to [01](01-control-plane.md), proto names to
+[08](08-api-and-ui.md).
 
-## Target design
+CRD enum values are PascalCase; proto enums map 1:1 in the prefixed
+UPPER_SNAKE form. Fields marked `M2+` or `M3` ship after the acceptance test
+(D-PROD-04); everything else is M1.
 
-### Two API groups, one direction of truth
+## Two API groups, one direction of truth
 
-The control plane runs on its own Kubernetes cluster. Its CRDs hold desired
-state and the current position of every rollout (D-TOPO-07). Postgres holds
-everything append-only or high-volume: history, audit, sessions, the blob
-index, attestations and the River queue (D-TOPO-04). Reconcile decisions read
-CRDs only.
-
-The bridge CRDs live on each landscape cluster. The bridge writes
-`Application`; the landscape operator writes `ApplicationPolicy` and
-`Boundary`. The control plane never reads or writes them directly. It learns
-their state only from signed status reports (D-PROD-05, D-ATT-01).
-
-Both groups start at `v1alpha1`. Bridge CRDs follow versioned-CRD
-compatibility rules from their first release, because operators upgrade
-bridges by hand (D-LAND-02, D-API-02).
+Control-plane CRDs hold desired state and rollout position. Postgres holds
+history, audit, sessions, sequences, and the River queue (D-TOPO-04,
+D-TOPO-07). The control plane never reads bridge CRDs; it learns their state
+from signed reports only (D-ATT-01). Both groups start at `v1alpha1`.
 
 | Group | Kind | Scope | Writer |
 | --- | --- | --- | --- |
-| `konfidence.cloud` | `Project` | cluster | API (platform admin) |
-| `konfidence.cloud` | `Landscape` | cluster | API (platform admin); status by controllers |
-| `konfidence.cloud` | `LandscapeGrant` | namespaced (project) | API (project admin requests, landscape admin approves) |
-| `konfidence.cloud` | `GitCredential` | namespaced (project) | API (project admin) |
-| `konfidence.cloud` | `Application` | namespaced (project) | API (project admin); status by controllers and workers |
-| `konfidence.cloud` | `Release` | namespaced (project) | release controller; status by workers |
-| `konfidence.cloud` | `PromotionConfig` | namespaced (project) | API (project pm) |
-| `konfidence.cloud` | `Promotion` | namespaced (project) | promotion-config controller or API; gate status by gate writers |
-| `konfidence.cloud` | `Deployment` | namespaced (project) | promotion controller; status by controllers and workers |
+| `konfidence.cloud` | `Project`, `Landscape` | cluster | API; status by controllers |
+| `konfidence.cloud` | `LandscapeGrant`, `GitCredential` | project namespace | API |
+| `konfidence.cloud` | `Application` | project namespace | API; status by controllers and workers |
+| `konfidence.cloud` | `Release` | project namespace | release controller; status by workers |
+| `konfidence.cloud` | `PromotionConfig` | project namespace | API; status by controller |
+| `konfidence.cloud` | `Promotion` | project namespace | config controller or API; gates by gate writers |
+| `konfidence.cloud` | `Deployment` | project namespace | promotion controller; status by controllers, workers, API |
 | `landscape.konfidence.cloud` | `Application` | cluster | bridge only |
-| `landscape.konfidence.cloud` | `ApplicationPolicy` | cluster | landscape operator |
-| `landscape.konfidence.cloud` | `Boundary` | cluster | landscape operator |
+| `landscape.konfidence.cloud` | `ApplicationPolicy`, `Boundary` | cluster | landscape operator |
 
-### Resources relate through project namespaces and the bundle identity
+## Identities and counters have one owner each
 
-```mermaid
-flowchart LR
-  subgraph CP["control plane: konfidence.cloud"]
-    Project -->|owns namespace| NS[(project namespace)]
-    GitCredential -.->|credentialRef| Application
-    Application -->|snapshots into| Release
-    PromotionConfig -->|creates| Promotion
-    Release -->|promoted by| Promotion
-    Promotion -->|one per landscape| Deployment
-    LandscapeGrant -->|grants project access to| Landscape
-    Deployment -->|targets| Landscape
-  end
-  subgraph LS["landscape: landscape.konfidence.cloud"]
-    LApp[Application] -->|owns| HR[HelmRelease + ExternalArtifact]
-    Boundary -->|owns| LNS[(tenant namespaces)]
-    ApplicationPolicy -->|scoped by| Boundary
-    ApplicationPolicy -.->|selects by label| LApp
-  end
-  Deployment ==>|signed bundle| LApp
-  LApp ==>|signed report| Deployment
-  LandscapeGrant -.->|grant identity in bundle| Boundary
-```
+| Name | Form | Owner |
+| --- | --- | --- |
+| landscape ID | `lsc-<random>` in `Landscape.spec.landscapeID`, immutable | API at creation |
+| grant ID | `lgr-<random>` in `LandscapeGrant.spec.grantID`, immutable | API at creation (D-TEN-02) |
+| release ID | `sha256:…` over `konfidence.cloud/release-id/v1` lines | resolve job (D-REL-01) |
+| release label | `<application>@<sequence>` | release controller (D-REL-02) |
+| bundle component | `konfidence.cloud/p/<project>/<application>`, version `<sequence>.0.0` | build (D-BUN-01) |
+| delivery component | `konfidence.cloud/l/<landscape ID>/delivery`, version `<deliverySequence>.0.0` | delivery job (D-BUN-04) |
+| policy version | SHA-256 of the canonical effective policy of one application | bridge (D-POL-06) |
+| policy ref | `<policy name>@<metadata.generation>`, display only | bridge |
+| `setBy` | session subject, or `<issuer>#<sub>` for machines (M2+, D-API-04) | API |
+| release sequence | `Application.status.nextReleaseSequence` | release controller |
+| promotion sequence | `Application.status.nextPromotionSequence`, copied to `Promotion.spec.sequence` and `Deployment.spec.promotionSequence` | config controller or API |
+| delivery sequence (lseq) | `landscape_sequences.delivery_sequence`; CRD `deliverySequence` fields only mirror it (D-ATT-02) | delivery job |
+| report sequence | in every report; last accepted in `landscape_sequences.report_sequence` | bridge |
 
-All project-owned kinds live in the project namespace. A cross-project
-reference exists in one place only: a `credentialRef` to a `GitCredential`
-another project has shared (D-SRC-03). The link between control plane and
-landscape is the verified bundle identity: project, application and
-landscape grant. The bridge stamps it as `konfidence.cloud/` labels
+Ordering, superseding and the dispatch fence use the promotion sequence,
+never the release sequence. Names: `Release` `<application>-<sequence>`,
+`Promotion` `<promotionConfig>-<promotion sequence>`, `Deployment`
+`<promotion>-<landscape>`, `LandscapeGrant` `<landscape>`, bridge
+`Application` `<project>.<application>`.
+
+Only the bridge sets `konfidence.cloud/project`, `konfidence.cloud/application`
+and `konfidence.cloud/landscape-grant` (grant ID) on landscape objects
 (D-POL-04).
 
-### Project owns a namespace and its role bindings
-
-`Project` keeps the ADR-0028 shape: a cluster-scoped resource that owns one
-namespace and carries `roleBindings`. The API enforces the roles (D-API-03).
+## Project owns one namespace and its role bindings
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
 kind: Project
 metadata: { name: payments }
 spec:
-  namespace: kden-project-payments   # immutable, defaulted
-  roleBindings:                      # ADR-0028: admin, pm, dev
-    admin: [{ session: { memberOf: [payments-admins] } }]
-status:
-  namespace: kden-project-payments
-  conditions: [Ready]
+  namespace: kden-project-payments          # immutable, defaulted
+  roleBindings: { project-admin: [{ session: { memberOf: [payments-admins] } }] }   # viewer | developer | release-manager | project-admin (08)
+  trustRules: []                            # M2+, D-API-04
+status: { conditions: [Ready] }
 ```
 
-Lifecycle: a finalizer deletes the namespace and every project resource in it.
-Deleting a project with live `Deployment`s is refused until removal promotions
-have run. Tombstones need the project to exist.
+A finalizer deletes the namespace. Deletion is refused while a project
+`Deployment` is a landscape's current desired entry.
 
-### Landscape is the control plane's record of one cluster and its bridge
-
-`Landscape` is cluster-scoped because several projects share one landscape
-(D-TEN-01). Platform admins create it. Its own `roleBindings` name the
-landscape admins who approve grants. Labels on the `Landscape` are what
-promotion selectors match.
+## Landscape records one cluster with one bridge
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
 kind: Landscape
-metadata:
-  name: de-fra-prod-1
-  labels: { env: prod, region: eu-central }
+metadata: { name: de-fra-prod-1, labels: { env: prod, ring: canary } }
 spec:
-  mode: Attached            # Attached | Isolated
-  trust:
-    mode: Pinned            # Pinned (TOFU, D-TRUST-01) | CustomerCA (D-TRUST-04)
-    caSecretRef: { name: acme-ca }   # CustomerCA only
-  roleBindings:
-    admin: [{ session: { memberOf: [fra-cluster-ops] } }]
+  landscapeID: lsc-7f3a9c                   # minted, immutable
+  mode: Attached                            # Attached | Isolated
+  trust: { mode: Pinned, caSecretRef: { name: acme-ca } }   # Pinned | CustomerCA (M3)
+  roleBindings: { landscape-admin: [{ session: { memberOf: [fra-cluster-ops] } }] }   # landscape-viewer | landscape-operator | landscape-admin (08)
+  staleAfter: 30m                           # LIVE vs stale (08)
+  linkTemplates:                            # the only deep-link source (D-UI-03)
+    - { group: vector.example, kind: Stage, url: "https://runtime.fra/stages/{namespace}/{name}" }
+  trustRules: []                            # M2+, D-API-04
 status:
-  bridge:
-    version: 1.4.2
-    capabilities: [thin-transfer, ctf-v1]
-    identityKeyFingerprint: SHA256:4f…   # mirror of the pinned key in bridge_keys
-    reportingLevelMax: full
-  bundleSequence: 118       # last sequence issued to this landscape
-  reportSequence: 977       # last accepted report sequence
-  connection: { state: Connected, since: 2026-10-29T08:12:00Z }
-  conditions: [Enrolled, Connected, BridgeOutdated]
+  phase: Enrolled                           # Pending | Unconfirmed | Enrolled
+  bridge: { version: 1.4.2, capabilities: [transfer.full, tombstone, attestation.v1], bundleFormats: [1], keyFingerprint: SHA256:4f… }
+  deliverySequence: 118                     # mirror of landscape_sequences
+  connection: { state: Connected, since: 2026-10-29T08:12:00Z }   # Connected | Disconnected
+  conditions: [Connected, BridgeOutdated, BridgeStateRegressed, FluxReady, FluxLockdown, FluxManaged]
 ```
 
-Controllers write `status.connection` on transitions only. Heartbeats go to
-the `bridge_connections` table, so 1000 landscapes do not churn the
-Kubernetes API (D-TOPO-02). The pinned key itself lives in Postgres; the CRD
-carries only its fingerprint for display. Enrollment, pinning and rotation
-are in [04-trust-and-attestation.md](04-trust-and-attestation.md).
+`Unconfirmed` lasts until a `landscape-admin` enters the enrollment code or
+skips with a reason; nothing is dispatched or imported before `Enrolled`
+(D-TRUST-02). Heartbeats stay in `bridge_connections`.
 
-Lifecycle: `Pending` until enrollment pins the bridge key, then `Enrolled`.
-Deleting a `Landscape` with active grants is refused.
-
-### LandscapeGrant is a project's approved access to one landscape
-
-A project admin creates the `LandscapeGrant` in the project namespace as a
-request. A landscape admin approves it through the API. The approval
-follows the ADR-0039 provenance pattern: the API writes it to status with the
-acting identity from the session. v1 allows one grant per project and
-landscape; the grant's name is the landscape name.
+## LandscapeGrant is a project's approved access to one landscape
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
@@ -151,125 +109,80 @@ kind: LandscapeGrant
 metadata: { name: de-fra-prod-1, namespace: kden-project-payments }
 spec:
   landscapeRef: de-fra-prod-1
-  request:
-    namespaces: [payments, payments-jobs]
-    clusterScoped: [{ group: apiextensions.k8s.io, kind: CustomResourceDefinition }]
+  grantID: lgr-01hx3k9q                     # minted, immutable (CEL self == oldSelf)
+  request: { namespaces: [payments, payments-jobs], clusterScoped: [{ group: apiextensions.k8s.io, kind: CustomResourceDefinition }],
+             namespaced: [{ group: monitoring.coreos.com, kind: ServiceMonitor }] }
 status:
-  approval: { state: Approved, setBy: alice@acme, setAt: 2026-10-20T10:00:00Z }
-  boundary:                 # from the latest bridge report
-    state: WaitingForApproval   # Unknown | WaitingForApproval | Ready
-    pendingKinds: [CustomResourceDefinition]
+  approval: { state: Approved, setBy: alice@acme, setAt: 2026-10-20T10:00:00Z }   # Requested | Approved | Revoked
+  boundary: { state: WaitingForBoundaryApproval, pendingKinds: [CustomResourceDefinition] }   # Unknown | WaitingForBoundaryApproval | Ready
 ```
 
-Promotions can target only landscapes with an approved grant. The grant
-identity `payments/de-fra-prod-1` travels in every bundle. The bridge matches
-it against a local `Boundary`. Approval on the control plane allows sending.
-The `Boundary` on the landscape decides what runs.
+One grant exists per project and landscape. Promotions target only
+landscapes with an `Approved` grant.
 
-### GitCredential points at a Secret and never holds key material
+## GitCredential points at a Secret and scopes its use
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
 kind: GitCredential
-metadata: { name: github-app, namespace: kden-project-payments }
+metadata: { name: github-pat, namespace: kden-project-payments }
 spec:
-  type: GitHubApp           # GitHubPAT | SSHDeployKey | GitHubApp (D-SRC-02)
-  secretRef: { name: github-app-key }   # same namespace
+  type: GitHubPAT                           # GitHubPAT | SSHDeployKey (M2+) | GitHubApp (M2+)
+  secretRef: { name: github-pat }           # same namespace; key material never in Postgres
   knownHosts: "github.com ssh-ed25519 AAAA…"   # required for SSHDeployKey (D-SRC-04)
-  sharedWith: [checkout, platform]      # projects allowed to reference it
-status:
-  expiresAt: 2027-01-31T00:00:00Z       # PAT only
-  conditions: [Valid, ExpiringSoon]
+  githubApp: { appID: 123456, installationID: 7890 }   # required for GitHubApp (M2+)
+  grants: [{ project: payments, repositories: ["acme/payments-*"] }]   # required, owner included
+status: { expiresAt: 2027-01-31T00:00:00Z, conditions: [Valid, ExpiringSoon] }
 ```
 
-The API writes the Secret on upload and keeps no copy in Postgres
-(D-SRC-03). Workers read the Secret at fetch time. Nothing on the landscape
-side ever references a `GitCredential` (D-SRC-01).
-
-### Application declares sources and chart layout
-
-The control-plane `Application` is the unit a team delivers. It names its git
-sources and the charts built from them (D-SRC-06). Application values live in
-git as values files, so they are part of the commit snapshot. The CR holds no
-inline values.
+## Application declares sources and chart layout
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
 kind: Application
 metadata: { name: payments-api, namespace: kden-project-payments }
 spec:
-  sources:
-    - name: app
-      url: https://github.com/acme/payments-api
-      ref: main                 # branch or tag to track
-      credentialRef: { name: github-app }   # optional project: for shared ones
-  charts:
-    - name: api
-      source: app
-      path: deploy/chart
-      valuesFiles: [deploy/values.yaml]
-      dependsOn: []
-      crds: CreateReplace       # Skip | Create | CreateReplace (Flux policy)
-      overridable: [/replicaCount, /ingress/host]   # D-POL-02 allow-list
-  secretRequirements:
-    - { name: db, keys: [username, password] }       # D-POL-03
-  builders: []                  # D-PROD-03 builder contract, see 07
-  pollInterval: 5m              # D-SRC-05
+  sources:                                  # one in M1; builders M2+, builder/v1 contract in 07
+    - { name: app, url: https://github.com/acme/payments-api, ref: { branch: main },   # { branch } | { tag }
+        credentialRef: { name: github-pat }, builders: [] }   # add project: for a granted credential
+  charts:                                   # crds: Skip | Create | CreateReplace
+    - { name: api, source: app, path: deploy/chart, valuesFiles: [deploy/values.yaml], dependsOn: [],
+        crds: CreateReplace, overridable: [/replicaCount, /ingress/host] }
+  secretRequirements: [{ name: db, keys: [username, password] }]
+  pollInterval: 5m
 status:
-  sources:
-    - { name: app, latestCommit: 9c1e…, observedAt: 2026-10-29T08:00:00Z }
+  sources: [{ name: app, commit: 9c1e…, observedAt: 2026-10-29T08:00:00Z }]
+  resolved: { releaseID: sha256:e3b0…, at: 2026-10-29T08:00:30Z }
   latestRelease: { name: payments-api-42, sequence: 42 }
-  nextSequence: 43
+  nextReleaseSequence: 43
+  nextPromotionSequence: 18
   conditions: [SourcesReady, CredentialsValid]
 ```
 
-Charts within one application form a `dependsOn` graph. There is no data flow
-between them and no ordering across applications (D-LAND-03).
+The resolve job writes `status.resolved`. The controller creates a `Release`
+only for a release ID the application does not have yet (D-REL-01).
+`pollInterval` and `credentialRef` are outside the release ID.
 
-### Release is an immutable snapshot of commits and layout
-
-The release controller creates a `Release` when a source moves or the chart
-layout changes. Workers resolve dependencies, compute the release ID and build
-the bundle, then write `status`. A `Release` never changes after it reaches
-`Ready`. Its name is `<application>-<sequence>`.
+## Release is an immutable snapshot of deployable inputs
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
 kind: Release
-metadata:
-  name: payments-api-42
-  namespace: kden-project-payments
-  labels: { konfidence.cloud/application: payments-api }
-spec:
+metadata: { name: payments-api-42, namespace: kden-project-payments, labels: { konfidence.cloud/application: payments-api } }
+spec:                                       # immutable (CEL)
   application: payments-api
-  sequence: 42                  # human label payments-api@42 (D-REL-02)
-  sources:                      # sorted by name
-    - { name: app, url: https://github.com/acme/payments-api, path: deploy/chart, sha: 9c1e… }
-  layout: { … }                 # copy of spec.charts, secretRequirements, builders
-  layoutDigest: sha256:77ab…
+  sequence: 42
+  releaseID: sha256:e3b0…
+  sources: [{ name: app, url: https://github.com/acme/payments-api, sha: 9c1e… }]
+  dependencies: [{ chart: api, name: postgresql, version: 15.5.0, digest: sha256:aa12… }]
+  layout: { … }                             # copy of charts, secretRequirements, builders
 status:
-  phase: Ready                  # Resolving | Building | Ready | Failed
-  releaseID: sha256:e3b0…       # D-REL-01: commits + dependency digests
-  dependencies:
-    - { chart: api, name: postgresql, version: 15.5.0, digest: sha256:aa12… }
-  component:                    # OCM component version (D-BUN-01)
-    name: acme.example/payments/payments-api
-    version: 42.0.0
-    digest: sha256:5d41…        # bytes identity, D-REL-02
-  conditions: [Ready]
+  phase: Ready                              # Building | Ready | Failed
+  component: { name: konfidence.cloud/p/payments/payments-api, version: 42.0.0, digest: sha256:5d41… }
+  conditions: [Built, Signed]
 ```
 
-The release ID follows D-REL-01 and identifies sources. The component digest
-identifies bytes. A layout-only change therefore yields a new sequence, the
-same release ID and a new component digest. The controller deduplicates on
-`(releaseID, layoutDigest)`. Bundle content and signing are in
-[03-bundles-and-transfer.md](03-bundles-and-transfer.md).
-
-Retention: a `Release` stays while any retained `Deployment` references it,
-or while it is among the latest 10 of its application. The `releases` table
-keeps every release permanently for diffs (D-REL-03).
-
-### PromotionConfig defines targets, waves and gates
+## PromotionConfig declares source, targets, waves and gates
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
@@ -277,317 +190,261 @@ kind: PromotionConfig
 metadata: { name: prod, namespace: kden-project-payments }
 spec:
   application: payments-api
-  trigger:
-    after: { promotionConfig: staging }   # or { newRelease: true }
-    mode: Auto                            # Auto | Manual
-  targets:
-    - selector: { matchLabels: { env: prod } }   # or landscapes: [names]
-      values: { ingress: { host: pay.acme.example } }   # promotion-target layer
-  gates:                                   # ADR-0039 typed list
-    - type: explicit-approval.konfidence.cloud
-  waves:                                   # ordered; first matching wave wins
-    - name: canary
-      selector: { matchLabels: { canary: "true" } }
-      maxConcurrent: 1
-      failureThreshold: 0
-      completion: Attested                 # Attested | Dispatched (D-PROMO-03)
-    - name: rest
-      selector: {}
-      maxConcurrent: 20
-      failureThreshold: 2
-      completion: Attested
-      gates: [{ type: soak-1h.konfidence.cloud }]
+  source: { application: payments-api }    # { application } | { promotionConfig } (M2+); omitted = API only
+  mode: Auto                                # Auto | Manual
+  targets:                                  # landscapes, or selector (M2+), plus values
+    - { landscapes: [de-fra-prod-1, de-fra-prod-2], values: { ingress: { host: pay.acme.example } } }
+  gates: [{ type: explicit-approval.konfidence.cloud, requiresReporting: Health }]   # Health | Resources
+  waves:                                    # one wave in M1; selector, gates M2+; ackTimeout attached only
+    - { name: canary, selector: { matchLabels: { ring: canary } }, maxConcurrent: 1, failureThreshold: 0,
+        completion: Attested, timeout: 30m, ackTimeout: 15m, gates: [{ type: soak.konfidence.cloud }] }
+status:
+  lastSucceeded: { release: payments-api-41, promotion: prod-16 }
+  conditions: [Valid]
 ```
 
-Validation rejects a config at admission when a target landscape's reporting
-level cannot satisfy its wave's completion rule or gates (D-POL-05). Every
-target landscape must fall into exactly one wave. Rollout semantics are in
-[05-promotion-and-rollout.md](05-promotion-and-rollout.md).
+`maxConcurrent` and `failureThreshold` take an integer or a percentage;
+`completion` is `Attested | Dispatched`. A reporting level too low for
+`completion` or `requiresReporting` is a validation error (D-POL-05).
 
-### Promotion is a frozen rollout of one release
-
-A `Promotion` snapshots the release, the resolved landscape list, values,
-gates and waves at creation (ADR-0039). Later config edits never change a
-running promotion. Removal uses the same kind with `operation: Remove`, which
-produces tombstones (D-PROMO-04).
+## Promotion is a frozen rollout of one release
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
 kind: Promotion
 metadata: { name: prod-17, namespace: kden-project-payments }
-spec:
+spec:                                       # snapshot at creation, immutable
   promotionConfig: prod
-  release: payments-api-42
-  operation: Deploy             # Deploy | Remove
+  sequence: 17                              # promotion sequence
+  operation: Deploy                         # Deploy | Remove (M2+)
+  release: payments-api-42                  # empty for Remove
   gates: [{ type: explicit-approval.konfidence.cloud }]
-  waves:
-    - { name: canary, landscapes: [de-fra-prod-1], maxConcurrent: 1, failureThreshold: 0, completion: Attested }
-    - { name: rest, landscapes: [de-fra-prod-2, …], maxConcurrent: 20, failureThreshold: 2, completion: Attested, gates: [...] }
-  values: { de-fra-prod-1: { ingress: { host: pay.acme.example } } }
+  targets: [{ landscapes: [de-fra-prod-1, de-fra-prod-2], valuesDigest: sha256:91f2…, values: { … } }]
+  waves: [{ name: canary, landscapes: [de-fra-prod-1], maxConcurrent: 1, failureThreshold: 0, completion: Attested, timeout: 30m, ackTimeout: 15m }]
 status:
-  state: InProgress   # Waiting | Ready | InProgress | Succeeded | Failed | Superseded | Blocked
-  gates:              # ADR-0039 entries: type, state, reason, setBy, setAt
-    - { type: explicit-approval.konfidence.cloud, state: Satisfied, setBy: bob@acme, setAt: … }
-  waves:
-    - { name: canary, state: Succeeded, total: 1, completed: 1, failed: 0 }
-    - { name: rest, state: InProgress, total: 480, completed: 212, failed: 1, gates: [...] }
+  state: InProgress
+  gates:                                    # scope: promotion | wave/<name>
+    - { scope: promotion, type: explicit-approval.konfidence.cloud, state: Satisfied, reason: "", setBy: bob@acme, setAt: 2026-10-29T09:00:00Z }
+  rejection: { setBy: "", setAt: null, reason: "" }   # ADR-0040 Reject, terminal
+  waves: [{ name: canary, state: Rolling, total: 1, completed: 0, failed: 0, unreachable: 0 }]
 ```
 
-At 1000 landscapes the per-landscape values map can grow large. Values per
-landscape are stored once per distinct value set and referenced by digest
-when the snapshot exceeds 64 KiB. Sketch shape only; 05 owns the mechanics.
+Values are stored once per target entry, not per landscape.
 
-### Deployment is one release on one landscape
-
-The promotion controller creates one `Deployment` per target landscape
-(D-PROMO-02). It is the unit the UI shows as dispatched, attested or live
-(D-UI-02). Its name is `<promotion>-<landscape>`.
+## Deployment is one promotion on one landscape
 
 ```yaml
 apiVersion: konfidence.cloud/v1alpha1
 kind: Deployment
-metadata:
-  name: prod-17-de-fra-prod-1
-  namespace: kden-project-payments
-  labels:
-    konfidence.cloud/application: payments-api
-    konfidence.cloud/landscape: de-fra-prod-1
+metadata: { name: prod-17-de-fra-prod-1, namespace: kden-project-payments,
+  labels: { konfidence.cloud/application: payments-api, konfidence.cloud/landscape: de-fra-prod-1 } }
 spec:
-  promotion: prod-17
-  release: payments-api-42
-  landscape: de-fra-prod-1
-  grant: de-fra-prod-1
-  wave: canary
-  operation: Deploy
-  valuesDigest: sha256:91f2…    # promotion-target values sent in the bundle
+  { promotion: prod-17, promotionSequence: 17, operation: Deploy, release: payments-api-42,
+    componentDigest: sha256:5d41…, landscape: de-fra-prod-1, grantID: lgr-01hx3k9q, wave: canary,
+    valuesDigest: sha256:91f2… }
 status:
   phase: Attested
-  bundle:
-    sequence: 118               # landscape bundle sequence (D-ATT-02)
-    digest: sha256:c0ff…
-    transfer: Thin              # Thin | Full (D-XFER-04)
-    dispatchedAt: 2026-10-29T09:02:00Z
-  attestation:                  # latest accepted report for this deployment
-    reportSequence: 977
-    at: 2026-10-29T09:05:11Z
-    componentDigest: sha256:5d41…
-    effectiveValuesDigest: sha256:0a9b…
-    policy: { versions: [default@3, payments-api@7], digest: sha256:be11… }
-    health: Healthy
-  reason: ""                    # set for Refused, SecretsUnbound, WaitingForBoundary
-  conditions: [Dispatched, Attested, Superseded]
+  reason: Applied
+  message: ""
+  delivery: { sequence: 118, via: Stream, dispatchedAt: 2026-10-29T09:02:00Z }   # first delivery listing it
+  attestation:                              # patched only on a decision-relevant change; at = last change
+    { deliverySequence: 118, componentDigest: sha256:5d41…, effectiveValuesDigest: sha256:0a9b…,
+      policyVersion: sha256:be11…, policyRefs: [default@3, payments-api@7], reason: Applied,
+      health: Healthy, at: 2026-10-29T09:05:11Z }
+  conditions: [Dispatched, Attested]
 ```
 
-Phases run `Pending → Building → Dispatched → Applied → Attested`.
-Terminal failures are `Failed` and `Refused` (D-LAND-05). Blocking phases with
-a reason are `WaitingForBoundary`, `SecretsUnbound` and `PolicyAmbiguous`.
-`Superseded` marks a `Deployment` when a newer one for the same application
-and landscape dispatches. Deployment identity is release plus policy version
-(D-POL-06), so `status.attestation.policy` changes without a new
-`Deployment`. Each change appends a row to `deployment_history`.
+Report matching follows D-ATT-05 ([05](05-promotion-and-rollout.md)). UI
+freshness comes from `attestations`, never from this CR.
 
-The bundle sequence comes from `Landscape.status.bundleSequence`. The
-controller increments it with an optimistic-concurrency update before
-dispatch, so a landscape never sees two bundles with the same sequence.
-
-Retention: the controller keeps the current and the previous 5 `Deployment`s
-per application and landscape (D-TOPO-07). Older ones are deleted; their
-history stays in Postgres.
-
-### Bridge Application is the installed form of one bundle
-
-The bridge creates one cluster-scoped `Application` per installed control-plane
-application, named `<project>.<application>`. Operators read it but do not edit
-it. A local deletion is undone from the last bundle (D-LAND-05).
+## Bridge Application is the installed form of one application
 
 ```yaml
 apiVersion: landscape.konfidence.cloud/v1alpha1
 kind: Application
 metadata:
   name: payments.payments-api
-  labels:                         # set by the bridge from verified identity only
-    konfidence.cloud/project: payments
-    konfidence.cloud/application: payments-api
-    konfidence.cloud/landscape-grant: de-fra-prod-1
+  labels: { konfidence.cloud/project: payments, konfidence.cloud/application: payments-api, konfidence.cloud/landscape-grant: lgr-01hx3k9q }
 spec:
   release: { id: sha256:e3b0…, label: payments-api@42, componentDigest: sha256:5d41… }
-  bundleSequence: 118
-  charts:
-    - { name: api, artifactDigest: sha256:ab01…, dependsOn: [], crds: CreateReplace }
+  deliverySequence: 118
+  charts: [{ name: api, artifactDigest: sha256:ab01…, dependsOn: [], crds: CreateReplace }]
   secretRequirements: [{ name: db, keys: [username, password] }]
   overridable: { api: [/replicaCount, /ingress/host] }
 status:
-  phase: Ready     # Pending | Applying | Ready | Degraded | Refused | Blocked | Removing
-  policy: { versions: [default@3, payments-api@7], digest: sha256:be11… }
+  conditions: [{ type: Ready, status: "True", reason: Applied }]
+  health: Healthy
+  policyVersion: sha256:be11…
+  policyRefs: [default@3, payments-api@7]
   boundary: payments-fra
   targetNamespace: payments
   effectiveValuesDigest: sha256:0a9b…
   charts: [{ name: api, helmRelease: payments/payments-api-api, ready: true }]
-  conditions: [Ready, SecretsBound, PolicyResolved, BoundaryReady]
+  pendingUpdate: { componentDigest: sha256:77ee… }     # updates: Manual only (D-POL-07)
+  acceptedUpdate: { componentDigest: "", tombstoneSequence: 0, acceptedBy: "", acceptedAt: null }
 ```
 
-It owns one `HelmRelease` and one `ExternalArtifact` per chart in the target
-namespace. Kubernetes permits a cluster-scoped owner for namespaced
-dependents. A tombstone moves it to `Removing`. It is deleted once Helm
-uninstalls all charts (D-LAND-04, D-PROMO-04).
+State is the `Ready` condition plus one reason; there is no `phase`. `accept`
+writes `status.acceptedUpdate` through the bridge admin endpoint (D-LAND-06).
 
-### ApplicationPolicy is the operator's authoritative say
-
-The policy named `default` is the landscape-wide default. Every other policy
-selects applications by label inside one `Boundary` (D-POL-04). Two
-non-default matches set `PolicyAmbiguous` and block the application.
+## ApplicationPolicy is the operator's authoritative say
 
 ```yaml
 apiVersion: landscape.konfidence.cloud/v1alpha1
 kind: ApplicationPolicy
-metadata: { name: payments-api }
+metadata: { name: payments-api }            # the policy named "default" is the landscape default
 spec:
-  boundaryRef: payments-fra      # ignored for "default"
+  boundaryRef: payments-fra                 # ignored for "default"
   selector: { matchLabels: { konfidence.cloud/application: payments-api } }
-  action: Allow                  # Allow | Deny (D-LAND-05 refusal)
+  action: Allow                             # Allow | Deny
+  updates: Auto                             # Auto | Manual (D-POL-07)
   targetNamespace: payments
-  values: { api: { replicaCount: 4 } }   # highest precedence (D-POL-02)
+  values: { api: { replicaCount: 4 } }
   secretBindings:
-    - { requirement: db, secretStoreRef: { name: vault, kind: SecretStore } }
-  images:
-    transfer: Thin               # Thin | Full (D-XFER-04)
-    registries: [registry.fra.acme.internal]
-    requireSignatures: true
-  reporting: health              # none | health | resources | full (D-POL-05)
-status:
-  matchedApplications: [payments.payments-api]
-  conditions: [Valid]
+    - { requirement: db, secretStoreRef: { name: vault, kind: SecretStore }, remoteKey: payments/db }   # M2+, ESO
+    - { requirement: cache, secretRef: { name: cache-creds } }
+  images: { transfer: Full, registries: [registry.fra.acme.internal], requireSignatures: true }   # Full | Thin (M2+)
+  reporting: Health                         # None | Health | Resources
+status: { matchedApplications: [payments.payments-api], conditions: [Valid] }
 ```
 
-Policy version is `<name>@<metadata.generation>`. The policy digest is
-SHA-256 over the canonical spec of the default and the matching policy. Both
-go into every report. Policy semantics are in
-[06-landscape-bridge-and-policy.md](06-landscape-bridge-and-policy.md).
+M1 ships the `default` policy only. Per-application policies are M2+.
 
-### Boundary is the tenant fence a landscape admin draws
+## Boundary is the tenant fence a landscape admin draws
 
 ```yaml
 apiVersion: landscape.konfidence.cloud/v1alpha1
 kind: Boundary
 metadata: { name: payments-fra }
 spec:
-  grants: [{ project: payments, grant: de-fra-prod-1 }]
-  namespaces:
-    allowed: [payments, payments-jobs]
-    template: { labels: { team: payments } }
+  grant: lgr-01hx3k9q                       # exactly one grant ID (D-TEN-02)
+  namespaces: { allowed: [payments, payments-jobs], template: { labels: { team: payments } } }
   quota: { hard: { requests.cpu: "40", requests.memory: 80Gi } }
-  approvedClusterScoped:                 # always manual (D-TEN-01)
+  approvedClusterScoped:                    # CRDs, cluster kinds, webhooks
     - { group: apiextensions.k8s.io, kind: CustomResourceDefinition, names: [ledgers.payments.acme] }
-status:
-  namespaces: [payments, payments-jobs]
-  serviceAccount: konfidence-payments    # Flux impersonation target
-  pendingClusterScoped: []               # drives WaitingForBoundary
-  conditions: [Ready]
+  approvedNamespaced: [{ group: monitoring.coreos.com, kind: ServiceMonitor }]   # beyond the base set (D-TEN-03)
+status:                                     # serviceAccount = HelmRelease serviceAccountName
+  { namespaces: [payments, payments-jobs], serviceAccount: konfidence-payments,
+    pendingClusterScoped: [], blockingApplications: [], conditions: [Ready] }
 ```
 
-The `Boundary` owns its namespaces, ServiceAccount, RBAC and ResourceQuota.
-Every `HelmRelease` inside it runs as `status.serviceAccount` through
-`spec.serviceAccountName` (D-TEN-01). Deleting a `Boundary` deletes its
-namespaces, so the bridge holds a finalizer while installed applications
-reference it.
+In M1 the operator writes the `Boundary` by hand; automating namespaces, Role
+and quota is M2+. The finalizer holds while `blockingApplications` is set.
 
-### Postgres holds history, audit and everything high-volume
+## Reasons form one vocabulary for condition, report and Deployment
 
-Tables below are the stable set. Column lists name what other docs query;
-migrations own the rest. Every history table is append-only.
+The bridge `Ready` condition, the report entry `reason` and
+`Deployment.status.reason` all use this table. Adding a reason is additive;
+renaming one is breaking.
+
+| Reason | Set by | Deployment phase |
+| --- | --- | --- |
+| `Applied` | bridge | `Attested` when `Healthy` |
+| `Progressing`, `Removing` | bridge | unchanged |
+| `Removed` | bridge | `Attested` for `Remove` |
+| `Failed` | bridge, Flux gave up | `Failed` |
+| `Refused` | bridge | `Refused` from `Dispatched` or `Blocked` |
+| `WaitingForBoundaryApproval`, `AmbiguousPolicy`, `UnboundSecret`, `ValuesRejected`, `ImageRuleViolation`, `OutsideBoundary`, `RegistryNotConfigured`, `AwaitingLocalAcceptance`, `FluxUnavailable` | bridge | `Blocked` |
+| `BridgeTooOldForBundleFormat` | control plane | `Blocked` from `Dispatching`; back to `Dispatching` after a bridge upgrade |
+| `ReportingLevelLowered` | control plane | `Failed` from any non-terminal phase; affected gates go `Error` |
+| `Exported` | control plane | `Dispatched` (isolated) |
+| `AckTimeout` | control plane | `Unreachable` |
+| `WaveTimeout` | control plane | `Failed` from `Dispatching`, `Dispatched` or `Blocked` |
+| `NewerPromotion` | control plane | `Superseded` from any non-terminal phase |
+| `FencedByHistory` | control plane | `Superseded` by the dispatch fence |
+
+Report import rejections are API errors, not CR reasons:
+`EnrollmentUnconfirmed`, `KeyRevoked`, `SignatureInvalid`,
+`LandscapeMismatch` and `ReportSequenceRegressed`. A report whose
+(landscape ID, report sequence) is in `attestations` with the same
+`payload_digest` is an idempotent success. Any other report at or below the
+last accepted sequence is regressed and sets `BridgeStateRegressed` (D-ATT-03).
+
+## Every other enum in one table
+
+| Field | Values |
+| --- | --- |
+| `Deployment.status.phase` | `Pending`, `Dispatching`, `Dispatched`, `Blocked`; terminal: `Attested`, `Failed`, `Refused`, `Unreachable`, `Superseded`. [05](05-promotion-and-rollout.md) owns transitions |
+| `health` (report, bridge `Application`, `Deployment`) | `Healthy`, `Progressing`, `Degraded`, `Unknown` |
+| `Landscape.status.phase` | `Pending`, `Unconfirmed`, `Enrolled` |
+| `Release.status.phase` | `Building`, `Ready`, `Failed` |
+| `Promotion.status.state` | `Waiting`, `Ready`, `InProgress`, `Succeeded`, `Failed`, `Rejected`, `Superseded` |
+| wave `state` | `Waiting`, `Rolling`, `Complete`, `Failed` |
+| gate `state` | `Pending`, `Satisfied`, `Error` |
+| `bridge_keys.state` | `Unconfirmed`, `Pinned`, `Retired`, `Revoked` |
+| `via` | `Stream`, `CTF` in `dispatches`; `Stream`, `File` in `attestations` |
+| `audit_log.actor_kind` | `Session`, `Workload`, `System` |
+| `audit_log.outcome` | `Pending`, `Succeeded`, `Failed` |
+
+## Postgres holds history, counters and dispatch records
+
+History is append-only. Columns shown are the ones docs rely on.
 
 | Table | Purpose | Main columns |
 | --- | --- | --- |
-| `releases` | Permanent release index for diffs and paths | `project, application, sequence, release_id, layout_digest, component_digest, sources jsonb, created_at` |
-| `deployment_history` | Append-only record per deployment state change | `id, project, application, landscape, release_id, sequence, component_digest, policy_versions, policy_digest, values_digest, phase, bundle_sequence, promotion, wave, at` |
-| `promotion_history` | Promotion and gate transitions | `id, project, promotion, release_id, state, gate_type, set_by, reason, at` |
-| `audit_log` | Every mutating API call and override | `id, at, actor, actor_kind, project, action, object_ref, reason, request_digest` |
+| `landscape_sequences` | sole owner of both per-landscape counters | `landscape_id` PK, `delivery_sequence`, `report_sequence` |
+| `dispatches` | one row per signed delivery | `landscape_id, delivery_sequence, delivery_digest, via, created_at, acked_at`; PK `(landscape_id, delivery_sequence)` |
+| `dispatch_entries` | `Deployment`s a delivery covers; fence input | `landscape_id, delivery_sequence, project, application, deployment_uid, promotion_sequence, operation, component_digest, values_digest, grant_id` |
+| `releases` | every release, for diffs (D-REL-03) | `project, application, sequence, release_id, component_digest, sources, layout, created_at` |
+| `deployment_history` | every `Deployment` change | `deployment_uid, project, application, landscape_id, promotion, promotion_sequence, wave, operation, release_id, component_digest, values_digest, policy_version, phase, reason, delivery_sequence, at` |
+| `promotion_history` | promotion state and gate transitions | `project, application, promotion, promotion_sequence, release_id, state, scope, gate_type, set_by, reason, at` |
+| `attestations` | every accepted signed report | `landscape_id, report_sequence, delivery_sequence, key_fingerprint, via, received_at, payload, payload_digest`; unique `(landscape_id, report_sequence)` |
+| `audit_log` | every mutating API call and override | `id, at, actor, actor_kind, project, action, object_ref, reason, request_digest, outcome`; the CR write carries `id` in annotation `konfidence.cloud/audit-id` |
 | `sessions` | OIDC sessions (D-API-03) | `id_hash, subject, issuer, groups, created_at, expires_at, last_seen_at` |
-| `enrollment_tokens` | One-time bridge enrollment | `token_hash, landscape, created_by, expires_at, used_at` |
-| `bridge_keys` | Pinned, rotated and revoked bridge identity keys (D-TRUST-05) | `landscape, fingerprint, public_key, state, predecessor, pinned_by, pinned_at, revoked_at` |
-| `bridge_connections` | Live stream presence and heartbeats | `landscape, api_replica, bridge_version, capabilities, connected_at, last_heartbeat_at` |
-| `attestations` | Every accepted signed report, gRPC or file | `landscape, report_sequence, deployment, component_digest, values_digest, policy_digest, health, key_fingerprint, via, received_at, payload jsonb`; unique `(landscape, report_sequence)` |
-| `blobs` | Content-addressed blob index over registry storage | `digest, size, media_type, storage_ref, created_at, last_referenced_at` |
-| `component_blobs` | Which blobs a component version needs | `component_digest, blob_digest` |
-| `landscape_blobs` | Reported bridge inventory (D-XFER-03) | `landscape, blob_digest, reported_at` |
-| `transfers` | Resumable transfer state | `id, landscape, bundle_sequence, mode, content, bytes_total, bytes_done, state, updated_at` |
-| `river_*` | River job queue, created by `rivermigrate` | `river_job`, `river_leader`, `river_queue`, `river_migration` |
+| `enrollment_tokens` | one-time bridge enrollment | `token_hash, landscape_id, created_by, expires_at, used_at` |
+| `bridge_keys` | bridge keys and deny list (D-TRUST-05) | `landscape_id, fingerprint, public_key, state, predecessor, confirmed_by, skip_reason, created_at, revoked_at` |
+| `bridge_connections` | stream owner and heartbeats | `landscape_id, epoch, api_replica, bridge_version, capabilities, connected_at, last_heartbeat_at` |
+| `blobs` | content-addressed blob index | `digest, size, media_type, storage_ref, created_at, last_referenced_at` |
+| `component_blobs` | blobs a component version needs | `component_digest, blob_digest` |
+| `river_*` | River queue, created by `rivermigrate` | River's own |
 
-API replicas get change signals through `LISTEN/NOTIFY` on channel
-`landscape_dispatch`, payload = landscape name. The replica holding that
-landscape's stream then offers the new bundle (D-TOPO-04).
+No table stores a bridge's blob inventory or transfer progress. The inventory
+arrives in full with every `PlanTransfer` and state request file, and
+transfers resume by offset.
 
-## Decisions applied
+## Dispatch tables carry the sequence, the fence and the channel
 
-- D-PROD-02: no runtime kinds; a `Stage` is a manifest inside a chart or builder output.
-- D-PROD-05: control plane learns bridge-side state only from signed reports.
-- D-TOPO-01: `Landscape` models one cluster with one bridge.
-- D-TOPO-04: Postgres tables above, `LISTEN/NOTIFY` channel `landscape_dispatch`.
-- D-TOPO-05: River unique jobs keyed by `(release, landscape)` args.
-- D-TOPO-07: CRDs hold desired and current state; Deployment retention of current plus 5.
-- D-SRC-01, D-SRC-03: `GitCredential` with `secretRef`, `sharedWith`; no landscape reference.
-- D-SRC-02, D-SRC-04: `type` enum; `knownHosts` required for SSH; `expiresAt` and `ExpiringSoon`.
-- D-SRC-05, D-SRC-06: `pollInterval`; `sources[]` with per-source `credentialRef`.
-- D-REL-01, D-REL-02: `status.releaseID`, `status.component.digest`, `spec.sequence`.
-- D-REL-03: `releases` and `deployment_history` tables feed diffs and paths.
-- D-XFER-03, D-XFER-04: `landscape_blobs` inventory; `Deployment.status.bundle.transfer`.
-- D-LAND-02, D-LAND-03, D-LAND-04: bridge kinds, chart `dependsOn`, `crds` policy, ownership.
-- D-LAND-05: `action: Deny` yields `Refused` on the `Deployment`.
-- D-POL-01 to D-POL-06: `ApplicationPolicy` fields, `overridable`, `secretRequirements`, policy version and digest.
-- D-TEN-01: `LandscapeGrant` request and approval; `Boundary` with manual `approvedClusterScoped`.
-- D-TRUST-01, D-TRUST-04, D-TRUST-05: `Landscape.spec.trust`; `bridge_keys` with revocation.
-- D-ATT-01, D-ATT-02: `attestations` table; `bundleSequence` and `reportSequence` on `Landscape`.
-- D-PROMO-01 to D-PROMO-04: ADR-0039 `gates`, `waves`, `completion`, `operation: Remove`.
-- D-UI-02: `Deployment` phases separate dispatched from attested.
+`delivery_sequence` is allocated by `UPDATE landscape_sequences … RETURNING`
+in its own committed transaction; gaps are allowed. The transaction that
+writes `dispatches` and `dispatch_entries` also sends `NOTIFY` and is the
+dispatch fence (D-TOPO-07): for a `deployment_uid` not yet in the
+landscape's `dispatch_entries` it refuses a promotion sequence not above the
+last one for (application, landscape), or a promotion terminal in
+`promotion_history`; listed entries pass. An ack or export of
+delivery N moves exactly the `Deployment`s in its `dispatch_entries` to
+`Dispatched` (D-BUN-04). After a Postgres restore, `delivery_sequence`
+restarts 1000 above the highest known value (D-ATT-04). 01 owns the job.
 
-## Interfaces other docs depend on
+The one `LISTEN/NOTIFY` channel is `konfidence_events`, payload
+`<kind>:<landscape ID>`, kinds `dispatch`, `presence`, `revoke` and
+`attested`. 01 owns the listener rules.
 
-- Field names in every sketch above. Topic docs may add fields only after
-  this page lists them.
-- Identity triple in bundles and labels: `konfidence.cloud/project`,
-  `konfidence.cloud/application`, `konfidence.cloud/landscape-grant`.
-- Naming: `Release` = `<application>-<sequence>`, `Deployment` =
-  `<promotion>-<landscape>`, bridge `Application` = `<project>.<application>`.
-- Two sequences per landscape: `bundleSequence` (control plane issues, bridge
-  enforces) and `reportSequence` (bridge issues, control plane enforces).
-- Policy version format `<name>@<generation>` and the policy digest
-  definition, used by attestations (04) and history (08).
-- `Deployment.status.phase` values, used by rollout (05) and UI (08).
-- Postgres table names and the `landscape_dispatch` channel (01, 03, 04).
+## Retention keeps etcd at the sized budget
+
+A maintenance job prunes CRs to one rule (D-TOPO-07). Everything older lives
+only in Postgres, which keeps history permanently.
+
+- **`Deployment`**: per (application, landscape) the active, the last
+  successful and the last terminal one. A landscape's current desired entry
+  is never pruned, or it would drop out of the next delivery untombstoned.
+- **`Promotion`**: active ones, and terminal ones that own a retained
+  `Deployment`.
+- **`Release`**: referenced by a retained `Deployment`, an active `Promotion`
+  or a `PromotionConfig.status.lastSucceeded`, plus the 5 highest sequences
+  per application. This set is the rollback window.
 
 ## Path
 
-### v1 first steps
+1. **M1** Generate Go types, CRDs and enums from this page. CEL keeps
+   `Project.spec.namespace`, `Landscape.spec.landscapeID`,
+   `LandscapeGrant.spec.grantID`, `Release.spec` and `Promotion.spec`
+   immutable.
+2. **M1** Create migrations for every table above, plus River's own.
+3. **M1** Add a CI check that fails on a table, channel, reason or enum value
+   this page does not list.
+4. **M2+** Enable the fields marked `# M2+`.
 
-1. Generate Go types and CRDs for `Project`, `Landscape`, `GitCredential`,
-   `Application`, `Release` with kubebuilder markers. Add CEL rules for
-   immutable fields (`Project.spec.namespace`, `Release.spec`).
-2. Add `Deployment` and a minimal `Promotion` with a single wave and
-   `explicit-approval` only. `PromotionConfig` with `landscapes` lists, no
-   selectors.
-3. Generate the bridge `Application` and a `default`-only `ApplicationPolicy`.
-   Deploy `example-app` to one attached landscape with a full transfer.
-4. Create Postgres migrations for `releases`, `deployment_history`,
-   `audit_log`, `sessions`, `bridge_keys`, `attestations`, `blobs`,
-   `landscape_blobs`, plus River's own migrations.
-5. Add `LandscapeGrant` and `Boundary`, then per-application policies. Run the
-   D-PROD-04 acceptance test across one attached and one isolated landscape.
-
-### Later
-
-- Selectors, multiple waves and wave gates in `PromotionConfig`.
-- More than one grant per project and landscape.
-- `CustomerCA` trust mode and CRL handling.
-- Promote both groups to `v1beta1` once the acceptance test passes twice
-  without schema changes.
-
-## Open questions
-
-1. Where do per-landscape promotion values live when 1000 targets differ? The
-   64 KiB spill-over to a Postgres table conflicts in spirit with
-   "decisions read CRDs only". 05 decides.
-2. Does a removed application's tombstone need a `Release`, or should
-   `Promotion` accept an application with no release for removal?
-3. Should the release ID cover the chart layout digest? Today a layout-only
-   change keeps the release ID, which makes "same release ID" mean "same
-   sources", not "same deployable".
+Later: `v1beta1` once the acceptance test passes twice without schema
+changes; `ApplicationPolicy.spec.requiredSignatures` for customer co-sign;
+`Deployment` as a Postgres row if the M2 simulator at 150k objects shows
+etcd pressure.

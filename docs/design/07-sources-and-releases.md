@@ -1,390 +1,273 @@
 # Sources, credentials and releases
 
-This page defines how the control plane turns git commits into releases. It
-covers application sources, `GitCredential` types and their use, change
-detection, the builder contract, the release ID and its hashing, and the
-release diff and visualization semantics. It does not cover bundle signing and
-transfer ([03](03-bundles-and-transfer.md), [04](04-trust-and-attestation.md)),
-promotion ([05](05-promotion-and-rollout.md)) or the full field set of the CRDs
-([02](02-domain-model.md)).
+The control plane turns git commits into releases. This page defines
+sources, `GitCredential` types, change detection, the `builder/v1` contract,
+the release ID and the release history queries. Field names and conditions
+come from [02](02-domain-model.md), River job kinds from
+[01](01-control-plane.md). Bundle signing and transfer live in
+[03](03-bundles-and-transfer.md), promotion in
+[05](05-promotion-and-rollout.md).
 
-## Target design
+## One flow creates every release
 
-### A release is a snapshot of commits, built once
-
-The pipeline has four steps. Controllers decide each step; River jobs on the
-workers run it.
+Controllers decide each step; River jobs on the workers run it (D-TOPO-05).
 
 ```mermaid
 flowchart LR
-  P[poll job<br/>ls-remote] -->|new head SHAs| A[Application status]
-  W[GitHub webhook] -->|enqueue poll| P
-  A -->|settled change| C[source controller]
+  P[poll job<br/>ls-remote] -->|head SHAs| S[Application.status.sources]
+  W[GitHub webhook, M2+] -->|enqueue poll| P
+  S -->|settled change| C[application controller]
   C -->|enqueue| R[resolve job<br/>fetch, vendor deps,<br/>compute release ID]
-  R -->|new release ID| C
-  C -->|create Release CR,<br/>assign sequence| B[build job<br/>builders, OCM assembly]
-  B -->|component digest| REL[Release status]
+  R -->|status.resolved| C
+  C -->|new release ID only:<br/>assign sequence, create Release| B[build job<br/>builders, OCM assembly]
+  B -->|component digest| REL[Release.status]
 ```
 
-1. **Poll.** A poll job lists remote refs for each unique (repo URL, ref,
-   credential). It writes the observed head SHA into the `Application` status.
-2. **Resolve.** After a settle window of 30 s without further head changes, the
-   source controller enqueues one resolve job per application. The job fetches
-   each source at its head SHA (depth 1), vendors chart dependencies, and
-   computes the release ID.
-3. **Create.** If no `Release` with that release ID exists for the application,
-   the controller assigns the next sequence number and creates the `Release`.
-   An equal release ID creates nothing.
-4. **Build.** A build job runs the builders, assembles the OCM component
-   version, stores it in the orchestrator-local registry and writes the
-   component digest into the `Release` status.
+1. **Poll.** A poll job lists remote refs per unique (repo URL, ref,
+   credential) and writes the head SHA into `Application.status.sources`.
+2. **Resolve.** After 30 s without further head changes, the controller
+   enqueues one resolve job per application. The job fetches each source at
+   its SHA (depth 1), vendors chart dependencies, computes the release ID and
+   writes `status.resolved{releaseID, at}`.
+3. **Create.** If the application has no `Release` with that release ID, the
+   controller takes the number from `status.nextReleaseSequence`, increments
+   it and creates `<application>-<sequence>`. An equal release ID creates
+   nothing (D-REL-01).
+4. **Build.** The build job runs the builders, assembles the OCM component
+   `konfidence.cloud/p/<project>/<application>` at version `<sequence>.0.0`,
+   stores it in the orchestrator-local registry and writes
+   `Release.status.component`.
 
-The settle window groups commits pushed to several repos within seconds into
-one release. It is a heuristic, not atomicity: cross-repo consistency comes
-from promotion, not from source timing.
+The settle window groups commits pushed to several repos within seconds. It
+is a heuristic: cross-repo consistency comes from promotion, not from source
+timing.
 
-### Commits outside a source's path create no release
+## An application has one or more sources, each with its own credential
 
-A source is (repo URL, ref, path). A new head SHA that leaves the tree at
-`path` unchanged keeps the previous SHA for that source in the snapshot. The
-resolve job compares the git tree hash of `path` with the tree hash recorded on
-the previous `Release`. Monorepos therefore produce releases only when the
-application's directory changes.
+`Application.spec.sources[]` holds `name`, `url`, `ref` (`branch` or `tag`),
+`credentialRef` and `builders`. `charts[]` names, per chart, its source and
+`path` (D-SRC-06). Source names are DNS labels, unique within the
+application. `credentialRef.project` names the owning project of a granted
+credential. M1 ships one source; multiple sources are M2+.
 
-### An application has one or more sources, each with its own credential
+A new head SHA that leaves every chart path of a source unchanged keeps the
+previous SHA in the snapshot (M2+). The resolve job compares git tree hashes
+with the ones recorded for the previous release. A source with builders
+skips this check, because a builder sees the whole tree. Monorepos therefore
+release only when an application's directories change.
 
-```yaml
-apiVersion: konfidence.cloud/v1alpha1
-kind: Application
-metadata: {name: payments, namespace: team-payments}
-spec:
-  sources:
-    - name: chart
-      repoURL: https://github.com/acme/payments-deploy
-      ref: {branch: main}
-      path: charts
-      credentialRef: {name: acme-app}
-      builders: [{name: helm}]
-    - name: runtime
-      repoURL: https://github.com/acme/payments
-      ref: {branch: main}
-      path: deploy/vector
-      credentialRef: {name: acme-app, project: platform}
-      builders: [{name: vector, config: {file: vector.yaml}}]
-```
+## Three credential types, one Secret each
 
-Source names are DNS labels and unique within the application. The ref is a
-branch in v1. `credentialRef.project` names the owning project when the
-credential is granted from another project.
+`GitCredential` is project-scoped. `type` selects the keys the referenced
+Secret must hold. Workers read key material at job time. It never appears in
+Postgres, River job arguments, logs or bundles (D-SRC-03).
 
-### Three credential types, one Secret each
+| `type` | Secret keys | Transport | Validity probe | Milestone |
+| --- | --- | --- | --- | --- |
+| `GitHubPAT` | `token` | HTTPS basic auth | `GET /repos/{owner}/{repo}` per granted repo | M1 |
+| `SSHDeployKey` | `identity` | SSH | `ls-remote` | M2+ |
+| `GitHubApp` | `privateKey`; `appID`, `installationID` in spec | HTTPS with minted token | mint a token | M2+ |
 
-`GitCredential` is project-scoped. Its `type` selects which keys the
-referenced Secret must hold. Key material lives only in that Secret, is read by
-workers at job time, and never appears in the DB, in River job arguments, in
-logs or in a bundle.
+**SSH.** Host keys are always pinned through `spec.knownHosts`, required for
+`SSHDeployKey` (D-SRC-04). It sits in spec, not in the Secret, because it is
+public and must be reviewable. GitHub publishes its entries
+([fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)).
+A host key mismatch fails the job; nothing is learned on first use.
 
-| Type | Secret keys | Transport | Validity probe |
-|------|-------------|-----------|----------------|
-| `pat` | `token` | HTTPS basic auth | `GET /repos/{owner}/{repo}` for each granted repo |
-| `ssh` | `identity`, optional `known_hosts` | SSH | `ls-remote` |
-| `githubApp` | `privateKey`, plus `appID` and `installationID` in spec | HTTPS with minted token | mint a token |
-
-**SSH.** Host keys are always pinned. The control plane ships GitHub's
-published `known_hosts` entries for github.com
-([GitHub SSH key fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)).
-A `known_hosts` key in the Secret replaces the shipped entries. A host key
-mismatch fails the job with condition `HostKeyMismatch`; nothing is learned on
-first use.
-
-**GitHub App.** The worker mints an installation token per job. It signs a
-JWT with RS256, `iss` set to the app's client ID or app ID and `exp` at most
-10 minutes ahead. It then calls
+**GitHub App.** The worker signs a JWT with RS256, `iss` set to the app's
+client ID or app ID and `exp` at most 10 min ahead. It then calls
 `POST /app/installations/{installation_id}/access_tokens` with `repositories`
 set to the job's repos and `permissions` set to `contents: read`
 ([installation tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app),
 [JWT](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)).
-Installation tokens expire after 1 hour. The worker caches a token in memory
-per (credential, repo set) and discards it 5 min before expiry. Tokens are
-never persisted. Scoping by `repositories` is what enforces grant
-restrictions for App credentials, because an installation often covers a
-whole organization.
+Tokens last 1 h. The worker caches them in memory per (credential, repo set)
+and drops them 5 min before expiry. Scoping by `repositories` enforces the
+grant, because one installation often covers a whole organization.
 
-### Expiry shows up as a condition before syncs fail
+## Grants scope a credential to projects and repositories
 
-A credential controller probes every `GitCredential` every 6 h and after each
-Secret change. It sets these conditions:
+`spec.grants` lists `{project, repositories}` and is required, the owning
+project included. `repositories` holds `owner/repo` globs. Only an admin of
+the owning project edits grants. The API rejects an `Application` whose
+`credentialRef` has no matching grant. The controller re-checks the grant
+before each resolve job. A revoked grant stops fetches at the next poll;
+existing releases stay valid.
 
-- `Ready`: the last probe succeeded.
-- `ExpiresSoon`: for `pat`, the expiry lies within 14 days. The expiry comes
-  from the `github-authentication-token-expiration` response header on the
-  probe (unverified). If GitHub sends no header, the token has no expiry and
-  the condition is `False` with reason `NoExpiry`.
-- `Expired` or `Unauthorized`: the probe got 401. For `githubApp`, a
-  suspended or removed installation also lands here.
+## Expiry shows up as a condition before syncs fail
 
-Every `Application` that references the credential mirrors a failing
-condition as `SourceCredentialDegraded`, so the application owner sees it
-without access to the owning project. The UI raises `ExpiresSoon` on the
-project page.
+The `credential.check` job ([01](01-control-plane.md)) probes every
+`GitCredential` every hour and after each Secret change:
 
-### Grants share a credential with other projects, limited to repos
+- `Valid` is `True` after a successful probe. A 401, a host key mismatch, or a
+  suspended or removed App installation sets it `False` with the cause.
+- `ExpiringSoon` is `True` when a `GitHubPAT` expires within 14 days, and
+  `status.expiresAt` holds the date. The probe reads it from the
+  `github-authentication-token-expiration` response header. TODO(sources):
+  verify that GitHub sends this header; no checked GitHub page mentions it.
 
-The owning project lists grants on the credential itself:
+Every `Application` that references the credential mirrors a failure in
+`CredentialsValid=False`. The application owner sees it without access to the
+owning project.
 
-```yaml
-kind: GitCredential
-metadata: {name: acme-app, namespace: platform}
-spec:
-  type: githubApp
-  appID: "123456"
-  installationID: "7890"
-  secretRef: {name: acme-app}
-  grants:
-    - project: team-payments
-      repositories: ["acme/payments", "acme/payments-*"]
-```
+## Polling detects changes, webhooks only shorten the wait
 
-`repositories` is a list of `owner/repo` glob patterns and is required on
-every grant. Only an admin of the owning project can edit grants, which the
-API enforces at write time. The API also rejects an `Application` whose
-`credentialRef` points to a credential without a matching grant. The source
-controller re-checks the grant before each resolve job. Revoking a grant stops
-fetches at the next poll with condition `CredentialNotGranted`; existing
-releases stay valid.
+A scheduler job runs every 15 s and enqueues a poll job per due poll key
+(repo URL, ref, credential). Applications on the same repo and ref share one
+poll. `ls-remote` needs no clone. The default interval is 2 min, the minimum
+30 s; `spec.pollInterval` sets it per application. Poll jobs are River unique
+jobs, `ByArgs` on the poll key plus `ByPeriod` set to the interval
+([unique jobs](https://riverqueue.com/docs/unique-jobs)).
 
-### Polling detects changes, webhooks only shorten the wait
-
-A scheduler job runs every 15 s and enqueues a poll job for each due poll key
-(repo URL, ref, credential). Many applications on the same repo and branch
-share one poll. The poll job runs `ls-remote`, which needs no clone. The
-default interval is 2 min, the minimum is 30 s, and an application can lower
-its own interval. Poll jobs are River unique jobs: `ByArgs` on the poll key
-(tag `river:"unique"`) plus `ByPeriod` set to the interval
-([River unique jobs](https://riverqueue.com/docs/unique-jobs)).
-
-For GitHub App credentials the API exposes `POST /webhooks/github`. It
-validates `X-Hub-Signature-256` (HMAC-SHA256 over the body with the App's
-webhook secret)
+For `GitHubApp` credentials (M2+) the API exposes `POST /webhooks/github`. It
+validates `X-Hub-Signature-256`, an HMAC-SHA256 over the body with the App's
+webhook secret
 ([validating deliveries](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)).
-A `push` event maps the repository to its poll keys and enqueues those poll
-jobs right away. The control plane never takes a SHA from the payload: the
-poll job reads refs from git. A forged or replayed delivery can at most cause
-an extra poll.
+A `push` event enqueues the matching poll jobs at once. The control plane
+never takes a SHA from the payload, so a forged or replayed delivery causes
+at most an extra poll (D-SRC-05).
 
-### Builders turn a checked-out source into OCM resources
+## Build workers reach git and the declared dependency registries only
 
-A builder is a versioned contract owned by konfidence. The build job runs the
-builders listed on each source in order. `helm` is built in and runs in the
-worker process. Every other builder is a container image registered in the
+Only workers read git, and only github.com (D-SRC-01, D-SRC-02). The resolve
+job also reaches the chart and OCI registries that charts name as
+dependencies. No other control-plane process reaches outside. Builders get no
+network at all.
+
+## Builders turn a checked-out source into OCM resources
+
+`builder/v1` is the contract the runtime team builds against, and this page
+owns it (D-PROD-03). The built-in `helm` builder runs in the worker process
+(M1). Every other builder is a container image registered centrally in the
 control-plane configuration by name, image digest and contract version
-`builder/v1`. Applications reference builders by name only.
+(M2+). Applications reference builders by name only.
 
-The build job runs an image builder as a Kubernetes Job in a dedicated build
-namespace. Egress is denied, and the Job receives no service account token.
-The builder sees this layout:
+The build job runs an image builder as a Kubernetes Job in a build namespace.
+Egress is always denied, and the Job gets no ServiceAccount token. The
+builder sees this layout:
 
 | Path | Mode | Content |
-|------|------|---------|
+| --- | --- | --- |
 | `/in/request.json` | read-only | contract version, application, release ID, sequence, source name, builder `config` |
-| `/in/src/` | read-only | the source tree at `path`, no `.git` directory |
+| `/in/src/` | read-only | the source tree at its SHA, no `.git` |
 | `/in/vendor/` | read-only | vendored chart dependencies |
 | `/out/` | read-write | files the builder produces |
-| `/out/result.json` | read-write | the resource list below |
+| `/out/result.json` | read-write | `contract`, `resources[]` (`name`, `type`, `version`, `path`, `labels`) and `images[]` |
 
-```json
-{
-  "contract": "builder/v1",
-  "resources": [
-    {"name": "payments-stage", "type": "helmChart", "version": "1.4.0",
-     "path": "payments-stage-1.4.0.tgz",
-     "labels": {"konfidence.cloud/builder": "vector"}}
-  ],
-  "images": ["ghcr.io/acme/payments@sha256:..."]
-}
-```
+The build job adds each resource as an OCM resource stored as a local blob
+and labels it with the builder name and image digest. Resource names are
+unique within the release, and every image is pinned by digest. A non-zero
+exit, a missing `result.json` or a run longer than 15 min fails the build:
+`Release.status.phase` turns `Failed` and `Built=False` carries the last
+4 KiB of builder output.
 
-The build job adds each entry as an OCM resource with the stated type, stored
-as a local blob, and records the builder name and image digest as a label.
-Resource names must be unique within the release. Every image must be pinned
-by digest, and [03](03-bundles-and-transfer.md) decides how images travel. A
-non-zero exit, a missing `result.json` or a run longer than 15 min fails the
-build. The `Release` then gets condition `BuildFailed` with the last 4 KiB of
-builder output.
+Only `helmChart` resources deploy on a landscape (D-LAND-03). Other types
+travel with the bundle but are not deployed. A builder that wants manifests
+deployed wraps them in a chart. The runtime team's vector builder reads
+`vector.yaml`, writes a chart containing the `Stage` manifest and returns it
+as `helmChart`; konfidence checks only `result.json` (D-PROD-02).
 
-Only `helmChart` resources become deployable charts on a landscape (D-LAND-03).
-Other OCM types such as `blob` travel with the bundle, but the bridge does not
-deploy them. A builder that wants manifests deployed wraps them in a chart.
+**Built-in Helm builder.** Per chart in `charts[]` it runs `helm dependency
+build` against the vendored dependencies and `helm package`, and emits one
+`helmChart` resource. It collects images from `helm template` with default
+values plus the chart annotation `konfidence.cloud/images` for images that
+defaults do not render. If `helm template` fails, the build fails. A partial
+image list would surface later as a missing image on an isolated landscape.
 
-**Built-in Helm builder.** For each directory with a `Chart.yaml` under the
-source path, it runs `helm dependency build` against the vendored
-dependencies and `helm package`. It emits one `helmChart` resource per chart.
-It collects images from `helm template` with default values, plus a list in
-the chart annotation `konfidence.cloud/images`. The annotation covers images
-that default values do not render.
-
-**Vector builder (runtime team example).** The runtime team ships an image
-that reads `vector.yaml` from `/in/src`. It writes a chart containing the
-`Stage` manifest and returns it as a `helmChart` resource. Konfidence imports
-no runtime types and only checks `result.json` (D-PROD-02, D-PROD-03).
-
-### The release ID hashes a versioned line format
+## The release ID hashes a versioned line format
 
 The release ID is `sha256:` plus the hex SHA-256 of this UTF-8 text. Each
-line ends with `\n`, and fields are separated by a single tab:
+line ends with `\n`; fields are separated by one tab.
 
 ```text
 konfidence.cloud/release-id/v1
-source	chart	github.com/acme/payments-deploy	charts	3f9c...e1
-source	runtime	github.com/acme/payments	deploy/vector	a71b...04
-dep	chart	charts/payments	postgresql	15.5.2	sha256:9d0e...
+source	app	github.com/acme/payments-api	9c1e…
+dep	app	deploy/chart	postgresql	15.5.0	sha256:aa12…
+layout	sha256:3b7f…
 ```
 
-The serialization follows these rules:
-
-- The first line is the format version. Changing any rule below means a new
-  version line, and old IDs stay valid as they are.
-- `source` lines are sorted by source name, `dep` lines by (source name,
-  chart path, dependency name). Sorting is byte-wise.
-- The repo URL is normalized to `host/owner/repo`: lowercase host, no scheme,
-  no user, no `.git` suffix. SSH and HTTPS URLs of the same repo therefore
-  hash the same.
-- Paths are relative to the repo root, use `/`, and drop any leading `./` and
-  trailing `/`. An empty path is written as `.`.
+- The first line is the format version. Changing any rule means a new
+  version line; old IDs stay valid.
+- `source` lines sort by source name; `dep` lines by (source, chart path,
+  dependency name). Sorting is byte-wise.
+- Repo URLs normalize to `host/owner/repo`: lowercase host, no scheme, no
+  user, no `.git`. SSH and HTTPS URLs of one repo hash the same.
+- Paths are relative to the repo root, use `/` and drop a leading `./` and a
+  trailing `/`. An empty path is `.`. Sources carry no path; chart paths
+  enter through `dep` lines and the `layout` line.
 - SHAs are full 40-character lowercase hex.
 - A dependency digest is the SHA-256 of the archive the resolve job
-  downloaded, or the manifest digest for `oci://` dependencies. It is not the
-  `Chart.lock` digest field. The lock file is already covered by the commit
-  SHA, and the archive digest catches a re-pushed chart version.
-- Values must not contain tab or newline. The API rejects such names and
-  paths at write time.
+  downloaded, or the manifest digest for `oci://`. The `Chart.lock` digest
+  is not used: the commit SHA already covers the lock file, and only the
+  archive digest catches a re-pushed chart version.
+- The `layout` line is the SHA-256 of the RFC 8785 canonical JSON of the
+  build- and deploy-relevant spec: `charts[]` (`name`, `source`, `path`,
+  `valuesFiles`, `dependsOn`, `crds`, `overridable`), `secretRequirements`,
+  and each source's `builders` with their `config`. `pollInterval`,
+  `credentialRef` and `ref` stay outside; the SHA already pins the commit.
+- Values containing tab or newline are rejected by the API at write time.
 
-Protobuf is not used because its wire encoding is not canonical (D-REL-01).
-The line format can be reproduced with `printf` and `sha256sum`, which lets
-an auditor recompute an ID offline. The UI shows the first 12 hex
-characters.
+Equal release ID means equal deployable inputs. Changing a builder's config
+or a chart's CRD policy creates a new release without a commit.
+`Release.spec.layout` keeps a copy of that spec for diffs. Protobuf is not
+used, because its wire encoding is not canonical. `printf` and `sha256sum`
+reproduce the line part, which lets an auditor recompute an ID offline. The
+UI shows the first 12 hex characters.
 
-### Three identities, three questions
+## Three identities answer three questions
 
 | Identity | Example | Answers | Stable across rebuilds |
-|----------|---------|---------|------------------------|
-| Release ID | `sha256:4be1...` | which sources and dependencies | yes |
-| Component digest | `sha256:77c0...` | which exact bytes ship | no, depends on builder versions |
-| Sequence | `payments@42` | what humans and the CLI type | yes, one per release |
+| --- | --- | --- | --- |
+| release ID | `sha256:e3b0…` | which sources, dependencies and layout | yes |
+| component digest | `sha256:5d41…` | which exact bytes ship | no, depends on builder versions |
+| release label | `payments-api@42` | what humans and the CLI type | yes, one per release ID |
 
-The sequence is a per-application counter kept in `Application` status. The
-controller increments it with an optimistic update before it creates the
-`Release`, so numbers have no gaps. The `Release` name is
-`<application>-<sequence>`. Attestations, deployments and audit records store
-the release ID and the component digest; the sequence is a display label.
+Builder image versions are not release-ID inputs; they change only the
+component digest (D-REL-02). A `Release` pins its component digest after the
+first successful build. A failed build can be retried. A later builder upgrade
+never rebuilds existing releases. Attestations, deployments and audit records
+store the release ID and the component digest; the label is for display.
 
-A release ID is built once. The `Release` pins its component digest after the
-first successful build. A failed build can be retried and then produces the
-digest. A later builder upgrade does not rebuild existing releases.
+## Release history answers diff, placement and path queries
 
-### Release diffs and placement come from the DB history
+Workers append every release to `releases`: sources with SHA, dependencies,
+layout and component digest. Resource and image lists come from the stored
+component descriptor. The API answers these queries from Postgres, because
+they are not reconcile decisions (D-TOPO-07, D-REL-03). [08](08-api-and-ui.md)
+owns the RPC shapes.
 
-Workers write each release's resolved content to Postgres: sources with SHA
-and tree hash, dependencies, resources with type, version and digest, and
-images. The API answers visualization queries from this history (D-TOPO-07
-allows it, since these are not reconcile decisions). [08](08-api-and-ui.md)
-owns the RPC shapes; the semantics are these:
-
-- **Diff between two releases of one application.** For each source it
-  returns the SHA range with commits. For `pat` and `githubApp` credentials
-  the commits come from the GitHub compare API
-  `GET /repos/{owner}/{repo}/compare/{base}...{head}`, which returns at most
-  250 commits without pagination
+- **Diff** (M2+) between two releases of one application: per source the SHA
+  range with commits, from `GET /repos/{owner}/{repo}/compare/{base}...{head}`
+  for `GitHubPAT` and `GitHubApp`. That call returns at most 250 commits
+  without pagination
   ([compare](https://docs.github.com/en/rest/commits/commits#compare-two-commits)).
-  For `ssh` it returns the two SHAs only. It also lists dependency changes,
-  resources added, removed and changed, and image changes. Removed charts feed
-  removal by release diff (D-PROMO-04).
-- **Placement.** For a release, or for an application, it lists the landscapes
-  with their dispatched and attested release. Each entry carries the effective
-  values digest and the policy version from the last attestation (D-POL-06).
-- **Path.** For a release, it lists the promotions and waves it passed with
-  timestamps and gate outcomes, joined from `Promotion` and `Deployment`
-  history ([05](05-promotion-and-rollout.md)).
-
-## Decisions applied
-
-- **D-SRC-01**: only workers fetch; builders get the tree without `.git` and
-  no credentials; bundles hold built resources only.
-- **D-SRC-02**: `pat`, `ssh`, `githubApp`; host fixed to github.com, a base
-  URL field can be added later.
-- **D-SRC-03**: `GitCredential` with `type`, `secretRef` and `grants`
-  limited by repo patterns.
-- **D-SRC-04**: shipped or Secret-provided `known_hosts`, no TOFU; PAT expiry
-  probe sets `ExpiresSoon` 14 days ahead.
-- **D-SRC-05**: polling via `ls-remote` is the detector; webhooks only
-  enqueue a poll.
-- **D-SRC-06**: `spec.sources[]`, each with its own `credentialRef` and
-  builders.
-- **D-REL-01**: versioned tab-separated line format, sorted, normalized
-  URLs, archive digests for dependencies.
-- **D-REL-02**: release ID, component digest and sequence are separate; the
-  sequence lives in `Application` status.
-- **D-REL-03**: diff, placement and path queries over DB history.
-- **D-TOPO-05**: poll, resolve and build are River jobs; controllers only
-  decide.
-- **D-BUN-01**: the resolve job vendors dependencies; the Helm builder
-  packages them.
-
-## Interfaces other docs depend on
-
-- **Release ID format** `konfidence.cloud/release-id/v1`, used by
-  [04](04-trust-and-attestation.md) in signed reports and by
-  [05](05-promotion-and-rollout.md) as the promotion subject.
-- **Release status** carries `releaseID`, `componentVersion` (name, version,
-  digest) and conditions `Resolved`, `Built`, `BuildFailed`. Field names come
-  from [02](02-domain-model.md).
-- **Builder contract** `builder/v1`: the `/in` and `/out` layout and
-  `result.json`. The runtime team builds against this and nothing else.
-- **OCM resources from builders**: type `helmChart` is deployable, other
-  types are carried. [03](03-bundles-and-transfer.md) defines component
-  naming, the version string and signing.
-- **Image list** per release, digest-pinned, input to thin and full transfer
-  in [03](03-bundles-and-transfer.md).
-- **Credential conditions** `Ready`, `ExpiresSoon`, `Expired`,
-  `Unauthorized`, `HostKeyMismatch`, `CredentialNotGranted` and the mirrored
-  `SourceCredentialDegraded`, shown by [08](08-api-and-ui.md).
-- **Webhook endpoint** `POST /webhooks/github` on the API.
+  For `SSHDeployKey` the diff shows the two SHAs only. It also lists
+  dependency, layout, resource and image changes. Removed charts feed removal
+  by release diff (D-PROMO-04).
+- **Placement:** per release or application, the landscapes with their
+  dispatched and attested release, effective values digest and policy version
+  from `deployment_history` and `attestations` (D-POL-06).
+- **Path:** per release, the promotions and waves it passed, with timestamps
+  and gate outcomes from `promotion_history`.
 
 ## Path
 
-### v1 first steps
+Milestones are defined in `09-roadmap.md`.
 
-1. Implement the release ID serializer and hasher as a pure Go package with
-   golden-file tests, including SSH and HTTPS URLs that hash equal.
-2. Add `GitCredential` with type `pat` and the credential probe controller,
-   with `Ready` and `ExpiresSoon`.
-3. Add the poll scheduler and poll job (`ls-remote`, River unique by poll
-   key). Write observed SHAs into `Application` status for one source.
-4. Add the resolve job, the sequence assignment and `Release` creation, with
-   the built-in Helm builder only. This is enough for `example-app`
-   (D-PROD-04).
-5. Add multiple sources, the tree-hash skip and `ssh` with shipped
-   `known_hosts`.
-6. Add `githubApp` with token minting and grants with repo patterns.
-7. Add the release diff and placement queries.
+1. **M1** Release ID serializer and hasher, including the `layout` line, as a
+   pure Go package with golden-file tests (SSH and HTTPS URLs hash equal).
+2. **M1** `GitCredential` of type `GitHubPAT` with grants and the probe
+   controller setting `Valid` and `ExpiringSoon`.
+3. **M1** Poll scheduler and poll job for one source.
+4. **M1** Resolve job, `status.resolved`, sequence assignment and `Release`
+   creation; build job with the built-in Helm builder.
+5. **M1** Placement and path queries for the M1 UI screens.
+6. **M2+** Multiple sources, the tree-hash skip, `SSHDeployKey`.
+7. **M2+** `GitHubApp` with token minting, webhooks, the diff query.
+8. **M2+** Image builder runner for `builder/v1`, with the vector builder as
+   first consumer.
 
-### Later
-
-- The image builder runner and contract `builder/v1`, delivered with the
-  runtime team's vector builder as the first consumer.
-- Webhooks for GitHub App credentials.
-- Tag and semver-range refs.
-- A shared fetch cache across workers if fetch time dominates builds.
-- A GitHub Enterprise Server base URL on `GitCredential`.
-
-## Open questions
-
-1. Builder selection and builder `config` live in the `Application` spec, not
-   in git, so changing them does not change the release ID under D-REL-01.
-   Either the ID includes a digest of the build-relevant spec, or build config
-   must live in the repo. See the challenge raised against D-REL-01.
-2. Should the Helm builder's image discovery fail the build when `helm
-   template` with default values errors, or fall back to the annotation only?
-3. Is 2 min the right default poll interval at 1000 landscapes and a few
-   thousand applications, given GitHub's limits for git-protocol traffic
-   (unverified)?
+Later: semver-range refs; a shared fetch cache across workers if fetch time
+dominates builds; a GitHub Enterprise Server base URL on `GitCredential`;
+worker-level dependency mirror rewrites with an extra CA bundle and
+`HTTPS_PROXY`. TODO(sources): verify GitHub's git-protocol limits against
+the 2 min default at a few thousand applications.

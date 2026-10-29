@@ -1,444 +1,296 @@
 # Landscape: bridge, policy and tenancy
 
-This page defines what the bridge does inside one landscape after it verifies and
-unpacks a bundle. It covers the bridge components, Flux install and
-adoption, rendering a landscape `Application` into Flux objects, ownership and
-deletion, `ApplicationPolicy`, `Boundary`, tenancy, and the status the bridge
-reports upward. Transfer, blob store and verify-and-unpack live in
-[03-bundles-and-transfer.md](03-bundles-and-transfer.md). Keys, signatures and
-attestation format live in
-[04-trust-and-attestation.md](04-trust-and-attestation.md). [02-domain-model.md](02-domain-model.md)
-owns field names; the sketches here show only
-the fields this topic needs.
+The bridge is the only konfidence component in a landscape. This page
+defines what it does with a verified delivery; transfer lives in
+[03](03-bundles-and-transfer.md), keys and reports in
+[04](04-trust-and-attestation.md), names in [02](02-domain-model.md).
 
-## The bridge renders verified bundles into Flux objects under operator policy
+## The bridge renders verified deliveries into Flux objects under operator policy
 
-The bridge is the only konfidence component in a landscape. It turns a
-verified bundle into cluster-scoped `Application` objects of the API group
-`landscape.konfidence.cloud`. It then evaluates the operator's policy and
-renders Flux `HelmRelease` and `ExternalArtifact` objects. Flux does the
-deployment. The bridge never runs Helm actions itself.
+Each application entry becomes a cluster-scoped `Application` of
+`landscape.konfidence.cloud`. The bridge evaluates policy and renders Flux
+objects; Flux deploys, and the bridge never runs Helm actions itself.
 
 ```mermaid
 flowchart LR
-  B[verified bundle] -->|import| A[Application]
+  D[verified delivery + bundles] -->|import| A[Application]
   P[ApplicationPolicy] -->|selects by label| A
   BD[Boundary] -->|confines| P
-  A -->|owns| EA[ExternalArtifact]
+  A -->|owns| EA[ExternalArtifact per chart]
   A -->|owns| HR[HelmRelease per chart]
-  BD -->|owns| NS[namespaces, SA, RBAC, quota]
+  BD -->|owns| NS[namespaces, deployer SA, Role, quota]
   HR -->|chartRef| EA
-  HR -->|impersonates| SA[tenant ServiceAccount]
-  A -->|status, attestations| CP[control plane]
+  HR -->|serviceAccountName| NS
+  A -->|signed reports| CP[control plane]
 ```
 
-### One leader runs every bridge loop
+## One bridge pod runs every loop
 
-The bridge runs as a Deployment with 2 replicas and a
-`coordination.k8s.io` Lease in its own namespace (D-TOPO-01). Only the leader
-runs controllers, holds the stream to the control plane and serves chart
-artifacts. The passive replica keeps its cache warm and does nothing else.
-
-The leader runs these components in one process:
+In v1 the bridge is one Deployment with one replica, `Recreate` strategy and
+a Lease against two processes after a force-delete or partition (D-TOPO-01).
+Blob store and artifact server share the pod and one ReadWriteOnce volume.
 
 | Component | Job |
-|---|---|
-| link | gRPC stream to the control plane, or CTF and state request file offline ([03](03-bundles-and-transfer.md)) |
-| importer | verify and unpack bundles into the blob store, write `Application` objects ([03](03-bundles-and-transfer.md), [04](04-trust-and-attestation.md)) |
-| artifact server | serves chart tarballs over in-cluster HTTP for `ExternalArtifact` URLs |
-| flux manager | installs or adopts Flux, runs the capability probe |
-| boundary controller | materializes namespaces, ServiceAccounts, RBAC and quota per `Boundary` |
-| application controller | resolves policy, binds secrets, checks admission, renders Flux objects |
-| reporter | builds signed status reports at the policy's reporting level ([04](04-trust-and-attestation.md)) |
+| --- | --- |
+| link | gRPC stream to the control plane, or CTF import and state request file export ([03](03-bundles-and-transfer.md)) |
+| importer | verify and unpack deliveries and bundles, write `Application` objects |
+| artifact server | serve chart tarballs in-cluster for `ExternalArtifact` URLs |
+| flux manager | install or adopt Flux, run the capability probe |
+| boundary controller | namespaces, deployer ServiceAccount, Role and quota per `Boundary` (M2+) |
+| application controller | resolve policy, bind secrets, check admission, render Flux objects |
+| reporter | build signed reports at the policy's reporting level ([04](04-trust-and-attestation.md)) |
+| admin endpoint | serve the bridge CLI (D-LAND-06) |
 
-The artifact server sits behind a Service whose readiness probe passes only on
-the leader. During failover helm-controller fails to fetch the artifact and
-retries on its next reconcile; nothing needs to coordinate this.
+The accepted v1 cost: on node loss, eviction plus volume reattach can take
+minutes, during which imports, reports and reconciles of changed charts
+pause. Running workloads are unaffected. The bridge retries the stream and
+transfers with exponential backoff and full jitter from 1 s to 5 min. Bridge
+releases ship as a signed chart plus image set that the operator imports into
+the landscape registry; deliveries never carry them.
 
-### The bridge installs a pinned Flux or adopts one that passes the probe
+## The bridge CLI talks to an admin endpoint, never through exec
 
-At startup and whenever the helm-controller Deployment changes, the flux
-manager decides between two modes:
+The `konfidence-bridge` CLI calls a ClusterIP admin endpoint through
+`kubectl port-forward` or an exposure the operator chooses. It checks the
+bearer token with TokenReview and each verb with SubjectAccessReview on
+`bridgeoperations.konfidence.cloud`.
 
-1. **Install.** No Flux CRDs exist and the bridge was started with Flux
-   install on. The bridge applies the Flux manifests embedded in its own
-   release. The images ship with the bridge release, so isolated landscapes
-   need nothing from public registries. The bridge sets the multi-tenancy
-   lockdown flags (see below) and the `ExternalArtifact` feature gate.
-2. **Adopt.** Flux CRDs exist. The bridge never edits an adopted Flux. It runs
-   the capability probe and reports what it finds.
+| Shipped Role | Verbs | Used for |
+| --- | --- | --- |
+| `konfidence-bridge-courier` | `export`, `import` | state request file out, CTF and report files in |
+| `konfidence-bridge-admin` | `enroll`, `trust`, `accept` | enrollment, `trust repin`, `trust crl import`, update acceptance |
 
-Parsing controller arguments is not enough. Current helm-controller docs list
-the `ExternalArtifact` gate with default `true`, while the `HelmRelease` docs
-still say `chartRef` to `ExternalArtifact` needs the flag
+No operator task needs `exec` into the bridge or read access to its Secrets.
+Client-certificate users run `kubectl create token` for a ServiceAccount bound
+to one of these Roles.
+
+## The bridge adopts a Flux that passes a behavioural probe
+
+At start and whenever the helm-controller Deployment changes, the flux
+manager picks a mode:
+
+1. **Adopt (M1).** Flux CRDs exist. The bridge never edits an adopted Flux.
+   It runs the probe and reports `FluxManaged=False`.
+2. **Install (M2+).** No Flux CRDs exist and install is enabled. The bridge
+   applies the pinned Flux manifests from its own release, with the
+   `ExternalArtifact` feature gate and the lockdown flags
+   `--no-cross-namespace-refs=true`, `--default-service-account=default` and
+   `--no-remote-bases=true`
+   ([multi-tenancy](https://fluxcd.io/flux/installation/configuration/multitenancy/)).
+
+The `ExternalArtifact` default differs between Flux versions
 ([options](https://fluxcd.io/flux/components/helm/options/),
-[HelmRelease](https://fluxcd.io/flux/components/helm/helmreleases/)). The
-default depends on the Flux version. The probe therefore tests behaviour: the
-bridge publishes a tiny probe chart as an `ExternalArtifact` and a
-`HelmRelease` in its own namespace. If the release reaches `Ready`, the
-landscape is usable. If not, every `Application` reports `FluxUnavailable` and
-the bridge renders nothing.
+[HelmRelease](https://fluxcd.io/flux/components/helm/helmreleases/)), so the
+probe tests behaviour, not flags. The bridge publishes a probe chart without
+container images as an `ExternalArtifact` and `HelmRelease` in its own
+namespace. If it reaches `Ready`, `FluxReady=True`; if not, every
+`Application` reports `FluxUnavailable`. Adopted Flux without lockdown flags
+gets `FluxLockdown=False` as a warning only, because tenants have no rights on
+Flux kinds (D-TEN-03).
 
-The probe also reads the lockdown flags from the controller arguments. A
-missing lockdown does not block rendering because the bridge sets
-`serviceAccountName` itself on every `HelmRelease` it writes. The landscape
-reports `FluxLockdown=False` instead, because tenants with write access to
-Flux objects could then bypass confinement.
+## Each chart becomes one ExternalArtifact and one HelmRelease
 
-### One HelmRelease per chart, ordered by dependsOn
+A landscape `Application` is 1..n charts (D-LAND-03). Per chart the
+application controller writes an `ExternalArtifact`
+(`source.toolkit.fluxcd.io/v1`) whose `status.artifact` points at the
+artifact server, and a `HelmRelease` with `chartRef` to it
+([ExternalArtifact](https://fluxcd.io/flux/components/source/externalartifacts/)).
+All Flux objects of one `Application` live in its `targetNamespace`, because
+`--no-cross-namespace-refs` allows references only within one namespace. The
+chart order becomes `dependsOn` between the `HelmRelease`s of one
+`Application`, never across applications.
 
-A landscape `Application` is 1..n charts (D-LAND-03). For each chart the
-application controller writes:
+| `HelmRelease` field | Value | Why |
+| --- | --- | --- |
+| `serviceAccountName` | the `Boundary`'s deployer ServiceAccount | Helm runs with tenant RBAC, never with helm-controller's cluster-admin rights |
+| `install.crds`, `upgrade.crds` | `Skip`, or the chart's `crds` policy once the `Boundary` approves its CRDs | CRDs need manual approval (D-TEN-01); both fields are always set |
+| `valuesFrom` | one Secret with the effective values | values never sit in plain `HelmRelease` specs |
+| `postRenderers` | kustomize `images`, digest-pinned to the landscape registry | image relocation (D-XFER-06) |
+| labels | the reserved `konfidence.cloud/` labels | policy, `Boundary` and reporter select by verified identity |
 
-- one `ExternalArtifact` (`source.toolkit.fluxcd.io/v1`) whose
-  `status.artifact` points at the artifact server URL, with `revision` and
-  `digest` from the bundle
-  ([ExternalArtifact](https://fluxcd.io/flux/components/source/externalartifacts/)),
-- one `HelmRelease` with `chartRef` to that `ExternalArtifact`.
+Images land in the operator-provided landscape registry (D-XFER-04). With
+`images.transfer: Full` the bridge pushes the image blobs from the transfer
+under a per-project path. `Thin` (M2+) checks that every digest already
+exists there. Without a configured registry, an application with images stops
+with `RegistryNotConfigured`.
 
-All Flux objects of one `Application` live in its release namespace, a
-namespace of its `Boundary` chosen by the policy. With
-`--no-cross-namespace-refs`, references work only within one namespace
-([options](https://fluxcd.io/flux/components/helm/options/)), so the
-`ExternalArtifact` sits next to its `HelmRelease`. In v1 every chart of an
-application installs into that one namespace (`targetNamespace` equals the
-release namespace). Charts that create objects in other namespaces of the same
-`Boundary` do so through tenant RBAC, not through Flux.
+## Admission uses the bundle's build-time metadata
 
-The chart order from the bundle becomes `dependsOn` between the
-`HelmRelease`s of the same `Application`. Flux starts a release only after its
-dependencies are ready
-([HelmRelease](https://fluxcd.io/flux/components/helm/helmreleases/)). The
-bridge never adds `dependsOn` across applications (D-LAND-03).
+Before writing a `HelmRelease`, the bridge checks the bundle's build-time
+metadata ([03](03-bundles-and-transfer.md)): rendered kinds and `crds/`.
 
-Rendered settings on every `HelmRelease`:
+- Cluster-scoped kinds, CRDs, webhooks or namespaced kinds outside the base
+  set that the `Boundary` has not approved stop the application with
+  `WaitingForBoundaryApproval`.
+- Flux kinds, `landscape.konfidence.cloud` kinds, or objects in namespaces
+  outside the `Boundary` stop it with `OutsideBoundary`.
+- Images outside `images.registries`, or unsigned while
+  `requireSignatures` is set (M2+), stop it with `ImageRuleViolation`.
 
-| Field | Value | Why |
-|---|---|---|
-| `serviceAccountName` | the tenant ServiceAccount of the `Boundary` | Helm runs with tenant RBAC, never as helm-controller |
-| `install.crds`, `upgrade.crds` | `Skip`, or `Create` / `CreateReplace` if the `Boundary` approved the chart's CRDs | CRDs need manual approval (D-TEN-01) |
-| `valuesFrom` | one Secret holding the effective values | values never sit in plain `HelmRelease` specs |
-| `postRenderers` | kustomize `images` with digest-pinned references | image relocation (D-XFER-06, [03](03-bundles-and-transfer.md)) |
-| labels | the reserved `konfidence.cloud/` labels | lets policy, `Boundary` and reporter select by verified identity |
+The tenant Role is the hard guard for kinds that appear only with landscape
+values. Those fail at apply time as `Failed` with Flux's RBAC message.
 
-Flux accepts `Skip`, `Create` and `CreateReplace` for both CRD policies, with
-`Create` as default; `CreateReplace` updates CRDs but never deletes them
-([HelmRelease](https://fluxcd.io/flux/components/helm/helmreleases/)). The
-bridge always sets both fields explicitly, so the Flux default never applies.
+## Ownership follows the Application, deletion is always explicit
 
-### The bridge checks admission before Flux sees a release
+The cluster-scoped `Application` owns its `HelmRelease`s, `ExternalArtifact`s
+and values Secrets. `Boundary` owns namespaces and never an `Application`
+(D-LAND-04).
 
-Before writing or updating a `HelmRelease`, the application controller renders
-the chart offline with the effective values through the Helm SDK. It collects
-every kind the chart would create and every CRD in `crds/`. The result decides
-three things:
+The bridge removes an application for three reasons only: a tombstone (M2+),
+a chart dropped between releases, or `action: Deny`. It sets `Removing`, and a
+finalizer deletes the `HelmRelease`s in reverse `dependsOn` order. Helm keeps
+CRDs and StatefulSet PVCs, the documented default.
 
-- cluster-scoped kinds, CRDs and admission webhooks not approved in the
-  `Boundary` stop the application with `WaitingForBoundaryApproval`,
-- images outside the policy's registry allow-list or without a required
-  signature stop it with `ImageRuleViolation`,
-- objects in namespaces outside the `Boundary` stop it with
-  `OutsideBoundary`.
+A local delete without a removal reason removes nothing. The finalizer strips
+owner references, and the importer recreates the `Application` from the last
+applied delivery and re-adopts the Flux objects (D-LAND-05). A `Boundary`
+with applications left does not delete; `status.blockingApplications` lists
+them.
 
-Tenant RBAC enforces the same limits again when helm-controller applies the
-release. The offline render exists to give a clear status before a half-applied
-Helm release, not as the only guard.
+## Exactly one policy applies, plus the default
 
-### Ownership follows the Application, deletion is always explicit
+`ApplicationPolicy` is cluster-scoped, written only by the landscape operator
+and authoritative on the landscape (D-POL-01). M1 ships the policy named
+`default` only; per-application policies are M2+.
 
-`Application` is cluster-scoped and owns its `HelmRelease`s, `ExternalArtifact`s
-and values Secrets. A namespaced dependent may have a cluster-scoped owner
-([Kubernetes](https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/)).
-`Boundary` is cluster-scoped and owns namespaces. It never owns an
-`Application` (D-LAND-04).
-
-The bridge removes an application only for one of three reasons: a signed
-tombstone, a chart dropped between releases (D-PROMO-04), or a deny policy. In
-each case the bridge marks the `Application` with a removal reason, then
-deletes it. A finalizer deletes the `HelmRelease`s in reverse `dependsOn` order
-and waits for Flux to finish each uninstall. Helm keeps CRDs and StatefulSet
-PVCs. That is the documented default, and the bridge does not delete them.
-
-If an operator deletes an `Application` locally without a removal reason, the
-finalizer orphans the Flux objects by stripping their owner references. The
-importer then recreates the `Application` from the last applied bundle and
-re-adopts the orphaned objects (D-LAND-05). Workloads keep running throughout.
-
-A `Boundary` with remaining applications does not delete. Its finalizer holds
-and its status lists the blocking applications. Deleting the namespaces under
-running workloads is never a side effect.
-
-## ApplicationPolicy is the operator's contract with every application
-
-`ApplicationPolicy` is cluster-scoped and written only by the landscape
-operator. It is authoritative on the landscape (D-POL-01).
-
-```yaml
-apiVersion: landscape.konfidence.cloud/v1alpha1
-kind: ApplicationPolicy
-metadata:
-  name: payments-prod
-spec:
-  boundaryRef: team-payments        # required, except on the default
-  selector:
-    matchLabels:
-      konfidence.cloud/application: payments
-  namespace: payments
-  values: { replicaCount: 3 }
-  secrets:
-    - requirement: db
-      externalSecret: { storeRef: vault-payments, key: payments/db }
-  images: { mode: thin, registries: [registry.corp.example], requireSignature: true }
-  reporting: health
-  deny: false
-```
-
-### Exactly one policy applies, plus the default
-
-Each application gets the landscape default plus at most one specific policy:
-
-1. The bridge sets the reserved labels `konfidence.cloud/project`,
-   `konfidence.cloud/application` and `konfidence.cloud/landscape-grant` from
-   the verified bundle identity. It drops any label under `konfidence.cloud/`
-   that a bundle carries (D-POL-04).
-2. The bridge finds the `Boundary` whose grant matches the application's
-   `landscape-grant` label. No match means `WaitingForBoundaryApproval`.
-3. Among policies with that `boundaryRef`, the bridge evaluates selectors.
-   Policies of other boundaries never match, whatever their selector says.
-4. Two matches stop the application with `AmbiguousPolicy`. The bridge never
-   merges.
-5. The effective policy is the default with the matching policy laid over it,
+1. The bridge sets `konfidence.cloud/project` and
+   `konfidence.cloud/application` from the verified bundle identity, and
+   `konfidence.cloud/landscape-grant` from the grant ID in the delivery
+   entry. It drops every `konfidence.cloud/` label a bundle carries
+   (D-POL-04).
+2. It finds the `Boundary` whose `spec.grant` equals that grant ID. No match
+   means `WaitingForBoundaryApproval`.
+3. Among policies with that `boundaryRef`, it evaluates selectors. Policies
+   of other boundaries never match.
+4. Two matches stop the application with `AmbiguousPolicy`. Nothing merges.
+5. The effective policy is `default` with the matching policy laid over it,
    field by field.
 
-The landscape default is the single policy marked as default, and it has no
-`boundaryRef`. If none exists, the bridge uses a built-in default: allow,
-release namespace from the `Boundary` template, image mode chosen by
-D-XFER-04, reporting level `health`.
+Without a `default` policy the bridge uses `action: Allow`, `updates: Auto`,
+the `Boundary`'s first namespace, `images.transfer: Full`, `reporting:
+Health`. The bridge computes the policy version over the effective policy and
+reports it with `policyRefs` (D-POL-06).
 
-The policy version is the SHA-256 of the canonical effective policy. It enters
-the deployment identity (D-POL-06) and every attestation. Changing a policy
-that affects an application causes a new reconcile and a new report.
+## Values merge in four layers, last wins
 
-### Values merge in four layers
+1. chart defaults,
+2. application values from the bundle,
+3. promotion-target values from the delivery entry,
+4. policy `values`.
 
-The bridge merges values in this order, last wins (D-POL-02):
+Layers 3 and 4 may set only keys on the application's `overridable` list
+(D-POL-02). The control plane checks layer 3 at promotion time, the bridge
+checks layer 4. A policy override outside the list, or a result failing the
+chart's values schema, stops the application with `ValuesRejected`; the
+operator's answer to a bad allow-list is deny. Reports carry only
+`effectiveValuesDigest`.
 
-1. chart defaults, inside the chart,
-2. application values, from the bundle,
-3. promotion target values, from the bundle for this landscape,
-4. landscape policy `values`.
+## Secret requirements bind to local stores
 
-Layers 3 and 4 may set only keys on the application's overridable allow-list.
-The control plane checks layer 3 at promotion time. The bridge checks layer 4.
-A policy override outside the allow-list stops the application with
-`ValuesRejected`. Operators who disagree with an application's allow-list use
-deny, not a silent override. The merged result must pass the chart's values
-schema. The bridge writes it to the values Secret and reports only its digest.
+A bundle declares secret requirements by name and keys (D-POL-03). Each entry
+in `secretBindings` binds one requirement:
 
-### Secret requirements bind to local stores
+- `secretRef` names an existing Secret in the `targetNamespace`. The bridge
+  checks the keys and never copies Secrets across namespaces.
+- `secretStoreRef` plus `remoteKey` (M2+) makes the bridge write an External
+  Secrets Operator `ExternalSecret` (`external-secrets.io/v1`) with one
+  `data` entry per key ([ESO](https://external-secrets.io/latest/api/externalsecret/)).
 
-A bundle declares secret requirements by name and keys (D-POL-03). A policy
-binds each requirement in one of two ways:
+An unbound requirement, or a bound Secret missing a key, stops the
+application with `UnboundSecret` naming the requirement. Secret values never
+enter reports.
 
-- **External Secrets Operator.** The bridge writes an `ExternalSecret`
-  (`external-secrets.io/v1`) in the release namespace with `secretStoreRef`
-  pointing at a `SecretStore` or `ClusterSecretStore`, `target.name` set to the
-  requirement name, and one `data` entry per key
-  ([ESO](https://external-secrets.io/latest/api/externalsecret/)).
-- **Plain Secret.** The policy names an existing Secret in the release
-  namespace. The bridge checks the keys and never copies Secrets across
-  namespaces.
+## Reporting level filters what leaves the landscape
 
-A requirement without a binding, or a bound Secret missing a key, stops the
-application with `UnboundSecret` and names the requirement. The bridge never
-reads secret values into reports.
+`reporting` is `None`, `Health` or `Resources`; D-POL-05 fixes what each
+level sends, and no resource `status` subtree ever leaves the landscape. The
+handshake and the state request file carry the effective level per
+application. When a level drops below what a running promotion needs, the
+control plane sets `ReportingLevelLowered` and gates fail closed
+([05](05-promotion-and-rollout.md)). At `None` the bridge keeps local status
+and sends nothing about the application.
 
-### Image rules decide transfer mode and admission
+## The operator can hold updates for local acceptance
 
-The `images` block holds three rules. `mode` sets thin or full transfer, which
-the bridge sends upward in the state request file and the stream handshake
-(D-XFER-04, D-XFER-05). `registries` is the allow-list checked against
-relocated image references. `requireSignature` makes the bridge reject images
-without a verified signature in the bundle. The signature format is defined in
-[04](04-trust-and-attestation.md).
+`updates: Manual` (D-POL-07) is the operator's brake. The bridge still
+verifies and stores every delivery. For that application it applies a changed
+release or a tombstone only after the operator runs:
 
-### Reporting level filters what leaves the landscape
-
-`reporting` is `none`, `health`, `resources` or `full` (D-POL-05). The reporter
-cuts the signed report to that level. At `none` the bridge still keeps local
-status but sends nothing about the application. If the level drops while a
-promotion waits on a gate, the reporter sends the lowered level once so gates
-fail closed with reason `ReportingLevelLowered`. At `none` nothing is sent,
-and the control plane sees the gate stay unsatisfied.
-
-### Deny refuses and removes
-
-`deny: true` refuses the application. A new application is never installed.
-An installed application is removed through the same finalizer path as a
-tombstone. The control plane shows "refused by landscape" (D-LAND-05). Deny is
-the only way an operator says no. Deleting the `Application` locally does not
-work, because the bridge recreates it.
-
-## Boundary turns a landscape grant into a confined tenant
-
-A `Boundary` is the landscape admin's answer to a project's access request
-(D-TEN-01). The project creates a `LandscapeGrant` in the control plane. The
-grant ID reaches the landscape in the bundle identity. The admin writes a
-`Boundary` for it.
-
-```yaml
-apiVersion: landscape.konfidence.cloud/v1alpha1
-kind: Boundary
-metadata:
-  name: team-payments
-spec:
-  grant: <GRANT_ID>
-  namespaces: { template: "payments-{{.Name}}", allowed: [payments, payments-jobs] }
-  quota: { requests.cpu: "20", requests.memory: 64Gi }
-  approved:
-    crds: [paymentrules.payments.example.com]
-    clusterKinds: []
-    webhooks: []
+```sh
+konfidence-bridge accept <PROJECT>.<APPLICATION> <COMPONENT_DIGEST_OR_TOMBSTONE_SEQUENCE>
 ```
 
-### The bridge automates namespaced tenancy
+Until then the application keeps its applied release, `status.pendingUpdate`
+names the waiting digest, and the reason is `AwaitingLocalAcceptance`.
+`accept` writes `status.acceptedUpdate`; a later delivery with a different
+digest waits again. `Manual` on `default` holds the whole landscape, also as
+the stopgap after a control-plane key compromise (D-TRUST-03). The control
+plane can never accept.
 
-For each `Boundary` the boundary controller creates and owns, without asking:
+## Deny refuses and removes
 
-- the namespaces from the template,
-- one tenant ServiceAccount per namespace, which every `HelmRelease` uses,
-- a RoleBinding granting that ServiceAccount the namespaced edit rights it
-  needs, in its namespaces only,
-- a ResourceQuota per namespace.
+`action: Deny` never installs a new application and removes an installed one
+through the finalizer path, with reason `Refused` (D-LAND-05). It is the only
+way an operator says no.
 
-On landscapes where the bridge installed Flux, the lockdown flags are set:
-`--no-cross-namespace-refs=true` on helm-controller and kustomize-controller,
-`--default-service-account=default` on both, `--no-remote-bases=true` on
-kustomize-controller
-([multi-tenancy](https://fluxcd.io/flux/installation/configuration/multitenancy/)).
-Without a `serviceAccountName`, a `HelmRelease` runs with helm-controller's
-cluster-admin rights
-([HelmRelease](https://fluxcd.io/flux/components/helm/helmreleases/)). The
-bridge never relies on the default and always sets the tenant ServiceAccount.
+## A Boundary confines one grant, and tenant RBAC is the hard guard
 
-### Cluster-scoped kinds, CRDs and webhooks always wait for a human
+The landscape admin copies a `LandscapeGrant`'s minted grant ID from the UI
+into `Boundary.spec.grant` (D-TEN-02). A recreated grant or project gets a new
+ID and waits for boundary approval again. Per `Boundary` the deployer setup is
+the template namespaces, one deployer ServiceAccount used by every
+`HelmRelease`, a konfidence-defined Role bound to it in each namespace, and a
+ResourceQuota per namespace.
 
-The bridge never approves cluster-scoped resources from bundle content. The
-admission check writes what it needs into `Boundary.status.pending`: CRD
-names, cluster-scoped kinds, webhook configurations, each with the requesting
-application and release. The admin approves by copying entries into
-`spec.approved`. The bridge then extends the tenant RBAC with exactly those
-cluster-scoped rights and sets the CRD policy to `Create` / `CreateReplace`
-for that chart.
+The Role covers a fixed base set: core ConfigMaps, Secrets, Services, Pods,
+ServiceAccounts and PVCs; `apps`; `batch`; `autoscaling`; PodDisruptionBudgets;
+Ingresses and NetworkPolicies; Roles and RoleBindings; Leases. It adds the
+namespaced kinds in `approvedNamespaced`. It never includes
+`*.toolkit.fluxcd.io` or `landscape.konfidence.cloud` kinds, or the `bind`,
+`escalate` and `impersonate` verbs, and is never the built-in `edit` or
+`admin` ClusterRole (D-TEN-03). RBAC escalation prevention keeps chart-created
+Roles within that set.
 
-A dedicated single-tenant landscape still has a `Boundary`. Its admin may
-approve broadly, but the approval is always written by a human.
+Cluster-scoped kinds, CRDs and webhooks always wait for a human. Admission
+lists them in `Boundary.status.pendingClusterScoped`; the admin approves by
+copying entries into `approvedClusterScoped`. The bridge then extends the
+deployer rights by exactly those items and sets the chart's CRD policy.
 
-## Status the bridge reports upward
+In M1 the operator creates the namespaces, ServiceAccount, Role and quota
+from the example manifests the bridge chart ships. The boundary controller
+automates them in M2+.
 
-The landscape `Application` carries a `Ready` condition and one reason from a
-fixed vocabulary. The reporter sends the reason with every status report,
-whatever the reporting level, except `none`. The control plane maps it onto
-`Deployment` status ([05](05-promotion-and-rollout.md)) and the UI
-([08](08-api-and-ui.md)).
+## The bridge reports one reason per application
 
-| Reason | Meaning | Who acts |
-|---|---|---|
-| `Applied` | all `HelmRelease`s ready at the expected release | nobody |
-| `Progressing` | Flux is installing or upgrading | nobody |
-| `Failed` | a `HelmRelease` failed; message carries Flux's reason | app team |
-| `Refused` | a deny policy matches ("refused by landscape") | landscape operator |
-| `WaitingForBoundaryApproval` | no `Boundary` for the grant, or pending cluster-scoped items | landscape admin |
-| `AmbiguousPolicy` | two specific policies match | landscape operator |
-| `UnboundSecret` | a secret requirement has no binding or misses keys | landscape operator |
-| `ValuesRejected` | an override is outside the allow-list or fails the values schema | operator or app team |
-| `ImageRuleViolation` | a registry or signature rule fails | operator or app team |
-| `OutsideBoundary` | the chart targets a namespace outside its `Boundary` | app team |
-| `FluxUnavailable` | the capability probe fails | landscape operator |
-| `Removing`, `Removed` | tombstone, dropped chart or deny is being applied | nobody |
-
-Landscape-wide conditions on the bridge itself: `FluxReady`, `FluxLockdown`,
-`FluxManaged` (installed versus adopted).
-
-## Decisions applied
-
-- **D-TOPO-01**: two replicas, Lease-based leader runs all loops.
-- **D-LAND-01**: `ExternalArtifact` plus `chartRef`; install or adopt decided
-  by a behavioural probe.
-- **D-LAND-02**: cluster-scoped `Application`, `ApplicationPolicy`, `Boundary`.
-- **D-LAND-03**: one `HelmRelease` per chart, `dependsOn` inside one
-  application, explicit CRD policy, no cross-application ordering.
-- **D-LAND-04**: `Application` owns Flux objects, `Boundary` owns namespaces,
-  CRDs and PVCs stay on uninstall.
-- **D-LAND-05**: local delete orphans and recreates; deny reports `Refused`.
-- **D-XFER-04, D-XFER-06**: policy `images.mode` feeds transfer choice; image
-  relocation through `postRenderers`.
-- **D-POL-01**: policy fields as listed above.
-- **D-POL-02**: four-layer merge, allow-list enforced on both override layers.
-- **D-POL-03**: ESO or plain Secret binding, `UnboundSecret`.
-- **D-POL-04**: reserved labels from verified identity, `boundaryRef`
-  confinement, one-match rule, `AmbiguousPolicy`.
-- **D-POL-05**: reporter filters by level, lowered level fails gates closed.
-- **D-POL-06**: policy version is the effective policy digest.
-- **D-TEN-01**: namespaced tenancy automated, cluster-scoped items approved in
-  `Boundary.spec.approved`.
-
-## Interfaces other docs depend on
-
-- **Import contract with [03](03-bundles-and-transfer.md).** The importer hands
-  over per application: verified identity (project, application, grant,
-  release ID, sequence), ordered chart list with blob digests, application
-  values, per-landscape promotion values, overridable allow-list, secret
-  requirements, image list with relocation targets, or a tombstone.
-- **Status reason vocabulary** in the table above, consumed by
-  [04](04-trust-and-attestation.md) (report payload),
-  [05](05-promotion-and-rollout.md) (wave completion and gates) and
-  [08](08-api-and-ui.md) (display). Adding a reason is additive; renaming one
-  is a breaking change.
-- **Policy version and effective values digest**, both SHA-256 over canonical
-  JSON, carried in every attestation ([04](04-trust-and-attestation.md)).
-- **Transfer-relevant policy extract** (`images.mode`, registries) for the state
-  request file and handshake ([03](03-bundles-and-transfer.md)).
-- **Reporting level per application**, sent at handshake and in the state
-  request file, used by promotion-config validation
-  ([05](05-promotion-and-rollout.md)).
-- **Grant ID** in the bundle identity, minted by `LandscapeGrant` in the
-  control plane ([02](02-domain-model.md), [01](01-control-plane.md)).
+The landscape `Application` has a `Ready` condition with one reason from
+[02](02-domain-model.md), sent in every report at `Health` or above.
+`Failed` means Flux has given up on a `HelmRelease` after its retries and
+remediation. Inference:
+helm-controller shows this as the `Stalled` condition with reason
+`RetriesExceeded`. TODO(bridge): verify against the helm-controller API docs
+before coding against it. `Progressing` is never a failure.
 
 ## Path
 
-### v1 first steps
+Milestones are defined in `09-roadmap.md`.
 
-1. Bridge skeleton with Lease leader election and the artifact server behind a
-   leader-only Service.
-2. Flux manager in adopt mode with the behavioural probe; `FluxReady` and
-   `FluxLockdown` conditions.
-3. Application controller for one chart: `ExternalArtifact`, `HelmRelease`,
-   values Secret, built-in default policy, one hand-written `Boundary`. This
-   deploys `example-app` to one attached landscape (D-PROD-04).
-4. Multi-chart `dependsOn`, finalizer-driven ordered removal, orphan and
-   recreate on local delete.
-5. `ApplicationPolicy` resolution with the one-match rule, values layers,
-   plain-Secret binding, deny.
-6. Boundary controller: namespaces, ServiceAccount, RoleBinding, quota; offline
-   admission render with `WaitingForBoundaryApproval`.
-7. Reporter with reporting levels and the reason vocabulary.
+1. **M1** Bridge pod with Lease, in-pod blob store and artifact server,
+   admin endpoint with TokenReview and SubjectAccessReview, shipped Roles.
+2. **M1** Flux adopt mode with the behavioural probe; `FluxReady`,
+   `FluxLockdown`, `FluxManaged`.
+3. **M1** Application controller: charts with `dependsOn`, values Secret,
+   images post-renderer, full transfer into the landscape registry,
+   `RegistryNotConfigured`, orphan and recreate on local delete.
+4. **M1** `default` policy only: values layers, `secretRef` binding,
+   `action: Deny`, `updates: Manual` with `accept`.
+5. **M1** Hand-written `Boundary` matched by grant ID; admission from
+   build-time metadata; example deployer manifests.
+6. **M1** Reporter with `None`, `Health`, `Resources` and the reason table.
+7. **M2+** Per-application policies, ESO, `Thin`, image signatures, removal,
+   boundary controller automation, Flux install mode.
 
-### Later
-
-- Flux install mode with embedded manifests and images.
-- ESO binding, image signature rules.
-- Per-chart target namespaces inside one `Boundary`.
-- A CLI helper that turns `Boundary.status.pending` into an approval patch.
-- Cross-application ordering, once someone shows a real need.
-
-## Open questions
-
-1. Which Flux version made `ExternalArtifact` default on, and should the
-   pinned Flux be at least that version? The probe makes this non-blocking.
-2. Should a lowered reporting level of `none` also send one final "reporting
-   off" marker, so the UI shows why reports stopped instead of showing stale
-   data?
-3. Does the offline admission render need the cluster's API discovery for
-   `Capabilities.APIVersions`, or is a render without it close enough for
-   admission?
+Later: active/passive bridge replicas; a bridge-owned control namespace per
+`Boundary` for the `HelmRelease`s, values Secret and deployer ServiceAccount,
+after checking that `--no-cross-namespace-refs` permits `targetNamespace`;
+per-chart target namespaces; a bridge support window with a pre-raise view of
+landscapes that would stop receiving deliveries.
