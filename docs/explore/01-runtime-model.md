@@ -45,7 +45,8 @@ A [runtime adapter](../glossary.md#runtime-adapter) fulfils the contract for mem
 A Kubernetes pod gets a node or sidecar proxy.
 A function platform gets a proxy in front of the function and a credential the function presents on egress.
 A WebAssembly host gets the contract as host functions.
-The member code stays the same in all three cases: it serves HTTP or gRPC and calls exports by vector name.
+The member code stays the same in all three cases.
+It serves HTTP or gRPC and calls exports by vector name.
 
 ## "Equal" is a test, not a promise
 
@@ -59,11 +60,13 @@ Example: a function platform without long-lived connections declares `no-streami
 
 ## Gateways implement exports the control plane describes
 
-The control plane gives a gateway provider a list of exports, each with a protocol, a path or topic, and a policy.
+The control plane gives a gateway provider a list of exports.
+Each export carries a protocol, a path or topic, and a policy.
 The provider configures its own data plane and writes back an address and a status.
 
 For Kubernetes-based gateways the natural interface is Gateway API: konfidence writes routes, and any conforming implementation serves them.
-Inference, not verified: Gateway API also covers east-west traffic inside a mesh (the GAMMA initiative), which would make it the sync data-plane interface too.
+Inference, not verified: Gateway API also covers east-west traffic inside a mesh (the GAMMA initiative).
+That would make it the sync data-plane interface too.
 TODO(fkasper): verify the GAMMA channel status before committing to it.
 
 ## The control plane stays small

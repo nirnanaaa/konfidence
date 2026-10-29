@@ -8,7 +8,8 @@ After reading, you can decide between the three options below.
 
 Two things must not leak into member code: the broker product and the broker client library.
 If either leaks, swapping NATS for Kafka means rewriting members, and that is a lock-in.
-The test for any design: change the [broker provider](../glossary.md#broker-provider) and redeploy, with no member code or image change.
+The test for any design: change the [broker provider](../glossary.md#broker-provider) and redeploy.
+No member code or image changes.
 
 ## Three options
 
@@ -47,7 +48,8 @@ Those bindings let a broker provider map the envelope to its native format witho
 
 A topic is an [export](../glossary.md#export) of the vector that publishes to it.
 The publisher owns the topic's name, event types and schema.
-A subscriber declares an [import](../glossary.md#import) of the topic, and the same policy that governs sync calls allows or denies it.
+A subscriber declares an [import](../glossary.md#import) of the topic.
+The same policy that governs sync calls allows or denies it.
 Each subscription owns its dead-letter topic, so one slow consumer never affects another.
 
 ## Guarantees are named profiles, and brokers declare which they support
@@ -74,8 +76,10 @@ A member signals overload by answering 429 or 503, and the adapter slows down.
 
 ## Prior art does most of this already
 
-Inference, not verified: Knative Eventing delivers CloudEvents over HTTP push through Broker and Trigger objects, and Dapr abstracts brokers behind pub/sub components.
-Konfidence differs in scope, not mechanism: topics are vector exports under the same policy as endpoints, and all runtimes pass one conformance suite.
+Inference, not verified: Knative Eventing pushes CloudEvents over HTTP through Broker and Trigger objects.
+Dapr hides brokers behind pub/sub components.
+Konfidence differs in scope, not mechanism.
+Topics are vector exports under the same policy as endpoints, and all runtimes pass one conformance suite.
 Before writing broker providers, check whether Dapr's components can serve as their implementation.
 TODO(fkasper): decide build or reuse after a spike.
 

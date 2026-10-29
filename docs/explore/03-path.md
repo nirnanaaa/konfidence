@@ -18,7 +18,8 @@ The first slice proves both and nothing else.
    Capabilities and [delivery profiles](../glossary.md#delivery-profile) are plain strings.
    Done when the reference vector below can be written in it.
 2. **Write the [conformance suite](../glossary.md#conformance-suite) against the API.**
-   It deploys a reference vector of two [members](../glossary.md#member): one serves an endpoint and publishes a topic, the other calls the endpoint and subscribes.
+   It deploys a reference vector of two [members](../glossary.md#member).
+   One serves an endpoint and publishes a topic; the other calls the endpoint and subscribes.
    It checks identity, registration, health, a sync call, async delivery and one policy denial.
    The suite exists before any adapter passes it.
 3. **Build two [runtime adapters](../glossary.md#runtime-adapter): Kubernetes pods and one non-Kubernetes runtime.**
@@ -49,7 +50,8 @@ These change the design, so they need an answer before step 1 ends.
 3. **Is async inside a vector, between vectors, or both?**
    This branch assumes both, with one policy.
 4. **Does sovereignty still constrain the design?**
-   If every mesh must run disconnected, broker providers and the control plane run per landscape, and federation is a later problem.
+   If every mesh must run disconnected, broker providers and the control plane run per landscape.
+   Federation then becomes a later problem.
 5. **Build or reuse the mediation layer?**
    Dapr and Knative Eventing cover much of the async path.
    A spike in step 4 decides whether konfidence wraps them or replaces them.
