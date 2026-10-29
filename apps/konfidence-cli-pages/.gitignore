@@ -1,5 +1,0 @@
-.svelte-kit/
-test-results/
-playwright-report/
-**/__screenshots__/**/*.png
-!**/__screenshots__/**/*-linux.png

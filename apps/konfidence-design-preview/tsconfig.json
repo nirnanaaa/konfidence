@@ -1,9 +1,0 @@
-{
-  "extends": "$app/tsconfig",
-  "compilerOptions": {
-    "allowImportingTsExtensions": true,
-    "sourceMap": true,
-    "strict": true
-  },
-  "include": ["src", "vite.config.ts", "playwright.config.ts"]
-}

@@ -1,8 +1,0 @@
-{
-  "files": [],
-  "references": [
-    { "path": "./packages/konfidence-api-client" },
-    { "path": "./apps/konfidence-mock-api" },
-    { "path": "./apps/konfidence-ui" }
-  ]
-}
