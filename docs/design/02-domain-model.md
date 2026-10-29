@@ -21,7 +21,7 @@ Both groups start at `v1alpha1`; the YAML below omits `apiVersion`.
 | `konfidence.cloud` | `Project`, `Landscape` | cluster | API; `Landscape` status by controller |
 | `konfidence.cloud` | `LandscapeGrant`, `GitCredential`, `Application`, `PromotionConfig` | project namespace | API; `GitCredential` status by controller |
 | `landscape.konfidence.cloud` | `Bundle` | cluster | bridge only |
-| `landscape.konfidence.cloud` | `ApplicationPolicy`, `Boundary` | cluster | landscape operator |
+| `landscape.konfidence.cloud` | `BundleDeploymentPolicy`, `Boundary` | cluster | landscape operator |
 
 ## Identities and counters have one owner each
 
@@ -175,10 +175,10 @@ status:
 State is the `Ready` condition plus one reason. A tombstoned application
 keeps its object with reason `Removed`.
 
-## ApplicationPolicy is the operator's authoritative say
+## BundleDeploymentPolicy is the operator's authoritative say
 
 ```yaml
-kind: ApplicationPolicy
+kind: BundleDeploymentPolicy
 metadata: { name: payments-api }            # "default" is the landscape default, the only one in M1
 spec:
   boundaryRef: payments-fra                 # ignored for "default"

@@ -77,7 +77,7 @@ The control plane never connects into a landscape (D-PROD-05).
 
 - **Pull only.** One bridge per landscape opens every connection. Its
   identity key is the landscape's only credential (D-XFER-01).
-- **Local authority.** The operator's `ApplicationPolicy` and `Boundary`
+- **Local authority.** The operator's `BundleDeploymentPolicy` and `Boundary`
   decide on the landscape (D-POL-01, D-POL-07, D-TEN-01).
 - **Trust anchored on the landscape.** Trust is pinned on first use and
   confirmed by an enrollment code on both sides. Recovery from a key

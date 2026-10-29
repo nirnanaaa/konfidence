@@ -186,7 +186,7 @@ reads charts and images. Secrets never travel in bundles (D-POL-03).
 Later: `CustomerCA` mode and PKCS#11 (M3), both before key transitions and
 before any customer whose security office approves the trust root; key
 transitions and bridge identity rotation; customer co-sign through
-`ApplicationPolicy.spec.requiredSignatures`; TPM-backed bridge identity.
+`BundleDeploymentPolicy.spec.requiredSignatures`; TPM-backed bridge identity.
 
 ## Open question
 

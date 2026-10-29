@@ -29,7 +29,7 @@ gets a new signed delivery (D-PROMO-06, D-BUN-04).
 The bridge sends a signed statement: what it holds, what it can read, what
 it last verified and applied, and what runs. The control plane answers with
 the newest delivery and the blobs the bridge lacks. The bridge verifies the
-delivery, applies the operator's `ApplicationPolicy` inside a `Boundary`, and
+delivery, applies the operator's `BundleDeploymentPolicy` inside a `Boundary`, and
 hands the charts to Flux. Its next statement reports the result.
 
 Attached and isolated landscapes move the same two messages through the same
@@ -123,7 +123,7 @@ Three rules hold across all three contracts:
 | Answer | The control plane's reply to a statement: the newest signed delivery and the blobs the bridge lacks. Offline it travels as a CTF. |
 | Application (control plane) | A deployable unit of a project: git sources plus chart layout. |
 | Bundle (bridge CR) | Cluster-scoped CR on a landscape for one slot as installed, named `<project>.<application>`: 1..n charts as `HelmRelease`s. |
-| ApplicationPolicy | Operator-owned CR on a landscape. It decides allow or deny, namespace, value overrides, secret bindings, image rules, reporting level and local acceptance. |
+| BundleDeploymentPolicy | Operator-owned CR on a landscape. It decides allow or deny, namespace, value overrides, secret bindings, image rules, reporting level and local acceptance. |
 | Attached landscape | A landscape whose bridge calls `Sync` over gRPC. |
 | Blob inventory | The sorted digests a bridge holds. A statement carries it, or its digest when unchanged; only missing blobs travel. |
 | Boundary | Landscape-admin CR that fences one project UID into namespaces, RBAC and quota. Writing it approves the grant. |

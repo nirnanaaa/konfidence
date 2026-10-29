@@ -144,7 +144,7 @@ backend suffices for the acceptance test and for attached-only installs.
 
 Each item has a design note in its topic doc but no milestone:
 
-- Customer co-sign through `ApplicationPolicy.spec.requiredSignatures`.
+- Customer co-sign through `BundleDeploymentPolicy.spec.requiredSignatures`.
   `Manual` acceptance covers four-eyes review until then.
 - Per-chart target namespaces.
 - Dependency mirror rewrites, an extra CA bundle and `HTTPS_PROXY` for build

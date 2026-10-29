@@ -94,7 +94,7 @@ in `konfidence-project/konfidence-docs`, `src/docs/extend-customize/decisions/`.
 - **D-LAND-01** Flux is the only deployment engine. The bridge serves charts
   as Flux `ExternalArtifact`s. It installs a pinned Flux or adopts one.
 - **D-LAND-02** Bridge-side CRDs: cluster-scoped `Bundle`,
-  `ApplicationPolicy`, `Boundary`. They are the bridge's versioned API.
+  `BundleDeploymentPolicy`, `Boundary`. They are the bridge's versioned API.
 - **D-LAND-03** A landscape `Bundle` is the installed form of one application: 1..n charts, each a
   `HelmRelease`, ordered by `dependsOn`. No data flows between charts. No
   cross-application ordering in v1.
@@ -108,7 +108,7 @@ in `konfidence-project/konfidence-docs`, `src/docs/extend-customize/decisions/`.
 
 ## Policy and tenancy
 
-- **D-POL-01** `ApplicationPolicy` belongs to the landscape operator and wins
+- **D-POL-01** `BundleDeploymentPolicy` belongs to the landscape operator and wins
   on the landscape. It sets allow/deny, namespace, value overrides, secret
   bindings, image rules, and the reporting level.
 - **D-POL-02** Values: chart < application < promotion target < landscape
@@ -249,6 +249,7 @@ in `konfidence-project/konfidence-docs`, `src/docs/extend-customize/decisions/`.
 - D-ATT-02: statement sequence per bridge key; answers return the accepted sequence.
 - D-PROMO-03: `Landscape.spec.statements: None` makes Dispatched final.
 - D-LAND-02/03/04/05: the bridge-side CR is `Bundle`, not `Application`, so the term is unique.
+- D-LAND-02, D-POL-*: the landscape policy CR is `BundleDeploymentPolicy`, not `ApplicationPolicy`.
 - D-PROMO-06 (new): desired slot with compare-and-set on promotion sequence.
 - D-API-02: capabilities replace handshake negotiation.
 - D-API-03: the API writes intent CRDs and Postgres rows.

@@ -125,7 +125,7 @@ time and fail as `Failed` with Flux's RBAC message.
 
 ## Exactly one policy applies, laid over the default
 
-`ApplicationPolicy` belongs to the landscape operator and wins (D-POL-01). M1
+`BundleDeploymentPolicy` belongs to the landscape operator and wins (D-POL-01). M1
 ships the `default` policy only.
 
 1. The bridge sets `konfidence.cloud/project` to the project UID and
