@@ -122,7 +122,7 @@ Three rules hold across all three contracts:
 | --- | --- |
 | Answer | The control plane's reply to a statement: the newest signed delivery and the blobs the bridge lacks. Offline it travels as a CTF. |
 | Application (control plane) | A deployable unit of a project: git sources plus chart layout. |
-| Application (bridge) | Cluster-scoped CR on a landscape for one slot as installed: 1..n charts as `HelmRelease`s. |
+| Bundle (bridge CR) | Cluster-scoped CR on a landscape for one slot as installed, named `<project>.<application>`: 1..n charts as `HelmRelease`s. |
 | ApplicationPolicy | Operator-owned CR on a landscape. It decides allow or deny, namespace, value overrides, secret bindings, image rules, reporting level and local acceptance. |
 | Attached landscape | A landscape whose bridge calls `Sync` over gRPC. |
 | Blob inventory | The sorted digests a bridge holds. A statement carries it, or its digest when unchanged; only missing blobs travel. |

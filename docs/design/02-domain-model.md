@@ -20,7 +20,7 @@ Both groups start at `v1alpha1`; the YAML below omits `apiVersion`.
 | --- | --- | --- | --- |
 | `konfidence.cloud` | `Project`, `Landscape` | cluster | API; `Landscape` status by controller |
 | `konfidence.cloud` | `LandscapeGrant`, `GitCredential`, `Application`, `PromotionConfig` | project namespace | API; `GitCredential` status by controller |
-| `landscape.konfidence.cloud` | `Application` | cluster | bridge only |
+| `landscape.konfidence.cloud` | `Bundle` | cluster | bridge only |
 | `landscape.konfidence.cloud` | `ApplicationPolicy`, `Boundary` | cluster | landscape operator |
 
 ## Identities and counters have one owner each
@@ -146,10 +146,10 @@ before any rollout sits on the first wave. A promotion copies `values`,
 `landscapeValues` and `waves` at creation; editing the config never changes
 a running promotion.
 
-## Bridge Application is the installed form of one slot
+## Bridge Bundle is the installed form of one slot
 
 ```yaml
-kind: Application
+kind: Bundle
 metadata: { name: payments.payments-api,   # <project>.<application>
   labels: { konfidence.cloud/project: prj-01hx3k9q, konfidence.cloud/application: payments-api } }
 spec:                                       # release empty and charts [] for a tombstone
@@ -190,7 +190,7 @@ spec:
   secretBindings: [{ requirement: db, secretRef: { name: db-creds } }]   # secretStoreRef + remoteKey M2+
   images: { transfer: Full, registries: [registry.fra.acme.internal] }   # Full | Thin (M2+)
   reporting: Health                         # None | Health | Resources
-status: { matchedApplications: [payments.payments-api], conditions: [Valid] }
+status: { matchedBundles: [payments.payments-api], conditions: [Valid] }
 ```
 
 ## Boundary is the tenant fence and the grant approval

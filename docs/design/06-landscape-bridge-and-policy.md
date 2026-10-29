@@ -1,7 +1,7 @@
 # Landscape: bridge, policy and tenancy
 
 The bridge is the only konfidence component in a landscape. It turns each
-entry of a verified delivery into a cluster-scoped `Application` and its Flux
+entry of a verified delivery into a cluster-scoped `Bundle` and its Flux
 objects under operator policy, with one reconcile per application. Flux
 deploys; the bridge never runs Helm actions itself. Transfer lives in
 [03](03-bundles-and-transfer.md), keys and statements in
@@ -15,7 +15,7 @@ ReadWriteOnce volume shared by blob store and artifact server (D-TOPO-01).
 | Component | Job |
 | --- | --- |
 | link | `Sync` long-poll and `FetchBlob`, or state request file out and CTF in ([03](03-bundles-and-transfer.md)) |
-| importer | verify and unpack deliveries and bundles, write `Application` objects |
+| importer | verify and unpack deliveries and bundles, write `Bundle` objects |
 | artifact server | serve chart tarballs in-cluster for `ExternalArtifact` URLs |
 | flux manager | install or adopt Flux, run the behavioural probe |
 | boundary controller | namespaces, deployer ServiceAccount, Role and quota per `Boundary` (M2+) |
@@ -57,7 +57,7 @@ The `ExternalArtifact` default differs between Flux versions
 ([options](https://fluxcd.io/flux/components/helm/options/)), so the probe
 tests behaviour, not flags. The bridge publishes an image-free probe chart as
 an `ExternalArtifact` and `HelmRelease` in its own namespace. `Ready` sets
-`FluxReady=True`; otherwise every `Application` reports `FluxUnavailable`.
+`FluxReady=True`; otherwise every `Bundle` reports `FluxUnavailable`.
 Adopted Flux without the lockdown flags gets `FluxLockdown=False` as a
 warning only, because tenants have no rights on Flux kinds (D-TEN-03).
 
@@ -68,13 +68,13 @@ The application controller compares two sets and closes the gap:
 - **Wanted charts:** the charts of the entry's bundle. A tombstone or
   `action: Deny` wants none.
 - **Owned objects:** the `HelmRelease`s, `ExternalArtifact`s and values
-  Secrets the `Application` owns through owner references (D-LAND-04).
+  Secrets the `Bundle` owns through owner references (D-LAND-04).
 
 It writes every wanted chart and deletes every owned object it no longer
 wants, `HelmRelease`s in reverse `dependsOn` order, while reporting
 `Removing`. With nothing wanted and nothing owned it reports `Removed` for a
 tombstone and `Refused` for a deny (D-LAND-05). Helm keeps CRDs and
-StatefulSet PVCs. A tombstoned `Application` keeps its object.
+StatefulSet PVCs. A tombstoned `Bundle` keeps its object.
 
 `Failed` means Flux has given up on a `HelmRelease` after its retries and
 remediation; `Progressing` never fails. Inference: helm-controller shows this
@@ -83,7 +83,7 @@ helm-controller API docs.
 
 Only an explicit entry changes what runs. An application missing from a
 delivery keeps running, so a faulty delivery never wipes a landscape
-(D-PROMO-04). A locally deleted `Application` comes back: the finalizer
+(D-PROMO-04). A locally deleted `Bundle` comes back: the finalizer
 strips owner references, and the importer recreates it from the last applied
 delivery and re-adopts the Flux objects.
 
@@ -94,7 +94,7 @@ server; the `HelmRelease` references it by `chartRef`
 ([ExternalArtifact](https://fluxcd.io/flux/components/source/externalartifacts/)).
 Both live in the `targetNamespace`, because `--no-cross-namespace-refs` allows
 references only within one namespace. Chart order becomes `dependsOn` within
-one `Application`, never across applications (D-LAND-03).
+one `Bundle`, never across bundles (D-LAND-03).
 
 | `HelmRelease` field | Value | Why |
 | --- | --- | --- |

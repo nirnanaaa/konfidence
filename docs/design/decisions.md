@@ -93,15 +93,15 @@ in `konfidence-project/konfidence-docs`, `src/docs/extend-customize/decisions/`.
 
 - **D-LAND-01** Flux is the only deployment engine. The bridge serves charts
   as Flux `ExternalArtifact`s. It installs a pinned Flux or adopts one.
-- **D-LAND-02** Bridge-side CRDs: cluster-scoped `Application`,
+- **D-LAND-02** Bridge-side CRDs: cluster-scoped `Bundle`,
   `ApplicationPolicy`, `Boundary`. They are the bridge's versioned API.
-- **D-LAND-03** A landscape `Application` is 1..n charts, each a
+- **D-LAND-03** A landscape `Bundle` is the installed form of one application: 1..n charts, each a
   `HelmRelease`, ordered by `dependsOn`. No data flows between charts. No
   cross-application ordering in v1.
-- **D-LAND-04** The `Application` owns its `HelmRelease`s and
+- **D-LAND-04** The `Bundle` owns its `HelmRelease`s and
   `ExternalArtifact`s; the `Boundary` owns namespaces. Helm keeps CRDs and
   PVCs on uninstall.
-- **D-LAND-05** The bridge recreates a locally deleted `Application`. An
+- **D-LAND-05** The bridge recreates a locally deleted `Bundle`. An
   operator refuses an application through policy deny, reported as `Refused`.
 - **D-LAND-06** The bridge CLI calls an admin endpoint guarded by TokenReview
   and SubjectAccessReview. Bridge keys never leave the bridge process.
@@ -248,6 +248,7 @@ in `konfidence-project/konfidence-docs`, `src/docs/extend-customize/decisions/`.
 - D-PROMO-05: `NoStatement` at wave timeout replaces `ackTimeout`.
 - D-ATT-02: statement sequence per bridge key; answers return the accepted sequence.
 - D-PROMO-03: `Landscape.spec.statements: None` makes Dispatched final.
+- D-LAND-02/03/04/05: the bridge-side CR is `Bundle`, not `Application`, so the term is unique.
 - D-PROMO-06 (new): desired slot with compare-and-set on promotion sequence.
 - D-API-02: capabilities replace handshake negotiation.
 - D-API-03: the API writes intent CRDs and Postgres rows.
