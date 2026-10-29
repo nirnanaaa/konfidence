@@ -1,300 +1,208 @@
 # Promotion, rollout and removal
 
-A `Release` reaches landscapes through `PromotionConfig` → `Promotion` →
-`Deployment`. This page defines gates, waves, completion, superseding,
-dispatch, rollback, and removal. Names, enums and the reason-to-phase table
-come from [02](02-domain-model.md), job kinds from [01](01-control-plane.md),
-the delivery format from [03](03-bundles-and-transfer.md), report
+A promotion moves one release, or a removal, to landscapes in gated waves.
+Each wave step writes desired slots with one compare-and-set, and every
+target status derives from the slot and the latest statement. Names come
+from [02](02-domain-model.md), job kinds from [01](01-control-plane.md), the
+delivery format from [03](03-bundles-and-transfer.md), and statement
 verification from [04](04-trust-and-attestation.md).
 
-## Three kinds carry the flow
+## A PromotionConfig declares where releases go
 
-| Kind | Lifetime | Answers |
-| --- | --- | --- |
-| `PromotionConfig` | long-lived, one per application and target set | Where does a release go, in which waves, behind which gates? |
-| `Promotion` | one per (config, promotion sequence) | Is this release cleared, and how far has it rolled out? |
-| `Deployment` | one per (promotion, landscape) | What did this landscape get, and what did it report back? |
+`PromotionConfig` is the one intent object for rollout (D-TOPO-07). Its
+`source` decides which releases start a promotion:
 
-Every `Promotion` belongs to a `PromotionConfig`, so rollbacks and removals
-inherit its gates, waves and targets.
+- `{application}` starts one for every release of the application that turns
+  `Ready`.
+- `{promotionConfig}` (M2+) starts one for every release whose promotion
+  through the upstream config `Succeeded`. This chains dev, staging and prod
+  without a pipeline kind.
+- `mode: Manual` starts none. Only API calls create promotions.
 
-## A PromotionConfig declares source, targets, waves and gates
+`waves` is an ordered list. Each wave has a landscape `selector`, `gates`, a
+`failureThreshold` (an integer or a percentage of the wave), and a
+`timeout`. Selectors see only landscapes with a `LandscapeGrant` in the
+project. A landscape joins the first wave whose selector matches it; a
+landscape that matches no wave is not a target. A gate that must hold before
+any rollout sits on the first wave.
 
-- **Source.** `{application}` creates a promotion for every new `Release`.
-  `{promotionConfig}` (M2+) creates one for every release that reached
-  `Succeeded` through the upstream config, which chains dev → staging → prod
-  without a pipeline kind. Without a source, or with `mode: Manual`, only
-  the API creates promotions.
-- **Targets.** A list of entries, each with `landscapes` or a `selector`
-  (M2+) plus promotion-target values (D-POL-02). Only landscapes with an
-  `Approved` `LandscapeGrant` are valid targets.
-- **Waves.** Waves partition the targets. A target joins the first wave whose
-  selector matches; a last wave without selector takes the rest. A target
-  that matches no wave is a validation error. `maxConcurrent` and
-  `failureThreshold` take an integer or a percentage of the wave.
-- **Gates.** At promotion scope and per wave (D-PROMO-02).
+`values` and `landscapeValues` are the promotion-target values layer
+(D-POL-02). The API rejects a key outside the application's `overridable`
+list when it creates the promotion.
 
-Chaining and catch-up read `status.lastSucceeded`, never old `Promotion`s.
+## A promotion is a row that snapshots its config
 
-## A Promotion snapshots everything it needs
+The API inserts a `promotions` row and takes its `seq` from the identity
+column. The row copies `waves`, `values` and `landscape_values` from the
+config, so editing the config never changes a running promotion.
+`release_id` is NULL for a removal.
 
-At creation the controller copies into `Promotion.spec`: release, operation
-(`Deploy` or `Remove`), gates, waves with their resolved landscapes, and the
-targets with values and `valuesDigest`. Selectors resolve once. Later config
-edits never change a running promotion.
+An ad-hoc promotion is an API call against a config. It names a `Ready`
+release or a removal and may narrow the waves to a list of landscapes. Each
+wave keeps its gates, so no API call skips approval. Override is the only
+bypass, and it is audited.
 
-Each promotion takes the next number from
-`Application.status.nextPromotionSequence`. Ordering, superseding and the
-dispatch fence use this promotion sequence, never the release sequence. A
-rollback is therefore a `Deploy` of an older release under a newer promotion
-sequence.
+`promotions.state` starts `InProgress` and ends `Succeeded`, `Failed` or
+`Rejected`. Superseded is never a promotion state: it is a target status,
+derived from the slot.
 
-## Gates follow ADR-0039 at two scopes
+## Gates follow ADR-0039 through one write
 
-Gate semantics stay as in ADR-0039 (D-PROMO-01):
+Every gate write is `SetGateState(promotion, wave, type, state, reason)`
+(D-PROMO-01). Approval, external writers, override and reject all use it,
+and each call writes one `gate_states` row plus an `audit_log` row.
 
-- The controller is type-agnostic. A scope is cleared when every gate entry
-  in it is `Satisfied`.
-- Gate types are DNS-style names, written by the API, core gate controllers
-  or third parties.
-- Entries are seeded `Pending` and carry `state`, `reason`, `setBy`, `setAt`.
-- Override (`OverrideGate`, M2+) sets a gate `Satisfied` through the API,
-  with the session as `setBy` and the justification as `reason`, audited.
-
-The redesign adds `scope`: `promotion` or `wave/<name>`. Promotion gates hold
-the whole promotion in `Waiting`. Wave gates are seeded when the previous wave
-completes, so a soak gate starts counting at the right moment.
-
-External writers set gates only through the API (`SetGateState`, owned by
-[08](08-api-and-ui.md)). This is the gate contract for the runtime
-(D-PROD-03). Machine writers authenticate with workload OIDC trust rules and
-appear as `<issuer>#<sub>` in `setBy` (D-API-04, M2+).
+- The wave step is type-agnostic. A wave clears when every gate of the wave
+  is `Satisfied`. `Pending` and `Error` both hold it.
+- Gate rows are seeded `Pending` when the previous wave completes, so a soak
+  gate counts from the right moment.
+- A caller who does not own the gate type needs project-admin and a reason.
+  The row gets `override = true` (M2+).
+- `Rejected` ends the promotion as `Rejected`. The wave step writes no
+  further slots. Slots already written stay; rollback is a new promotion.
 
 | Gate type | Writer | Satisfied when | Milestone |
 | --- | --- | --- | --- |
-| `explicit-approval.konfidence.cloud` | API `ApproveGate` | a user with approval rights on the project approves | M1 |
-| `soak.konfidence.cloud` | core gate controller | the configured duration has passed since the scope became eligible | M2+ |
+| `explicit-approval.konfidence.cloud` | a user with approval rights on the project | the user approves | M1 |
+| `soak.konfidence.cloud` | core gate writer | the configured duration has passed since seeding | M2+ |
+| external, DNS-style name | a runtime component through the API (D-PROD-03) | the writer says so | M2+ |
 
-`RejectPromotion` follows ADR-0040. The API writes `status.rejection` in `Waiting` or
-`InProgress`. The promotion stops dispatching at once and turns `Rejected`,
-which is terminal. Deployments already dispatched stay as they are.
+Machine writers authenticate through trust rules and appear as
+`<issuer>#<sub>` in `set_by` (D-API-04, M2+). A gate that needs data the
+reporting level withholds stays `Pending` until the wave timeout
+(D-POL-05). No config check runs at save time.
 
-## Validation rejects gates a landscape cannot feed
-
-A gate or completion rule that needs data a landscape never sends is a
-configuration bug (D-POL-05):
-
-- `completion: Attested` needs reporting level `Health` or `Resources` on
-  every landscape of the wave. `None` allows only `Dispatched` (D-PROMO-03).
-- A gate entry may declare `requiresReporting: Health | Resources`. Core
-  gates declare it in code, third-party gates in the config entry.
-- The control plane learns each landscape's effective level per application
-  from the handshake or the last state request file.
-
-The API rejects a failing `PromotionConfig` write with an error, not a status
-reason. The config controller re-checks when targets or levels change and
-sets `Valid=False`; an invalid config creates no promotions. If a running
-promotion meets a lowered level, the affected gates go `Error` and every
-non-terminal deployment goes `Failed`, both with `ReportingLevelLowered`.
-
-## Rollout runs wave by wave
-
-```mermaid
-stateDiagram-v2
-    [*] --> Waiting
-    Waiting --> Ready: promotion gates satisfied
-    Ready --> InProgress: first wave starts
-    state InProgress {
-        state "Waiting" as WaveWaiting
-        state "Failed" as WaveFailed
-        [*] --> WaveWaiting
-        WaveWaiting --> Rolling: wave gates satisfied
-        Rolling --> Complete: every Deployment counted, failures within threshold
-        Rolling --> WaveFailed: failures exceed threshold
-        Complete --> WaveWaiting: next wave
-    }
-    InProgress --> Succeeded: last wave complete
-    InProgress --> Failed: a wave failed
-    Waiting --> Rejected: RejectPromotion
-    InProgress --> Rejected: RejectPromotion
-    Waiting --> Superseded: every target superseded
-    InProgress --> Superseded: every remaining target superseded
-```
-
-In `Rolling` the controller keeps at most `maxConcurrent` deployments of the
-wave in flight. Pending deployments of connected landscapes take free slots
-first (`Landscape.status.connection`). When `failed + unreachable` exceeds
-`failureThreshold`, the wave fails, the promotion goes `Failed`, and nothing
-further dispatches. Deployments already out are not rolled back; rollback is
-an explicit promotion.
-
-A promotion with failures inside the threshold is `Succeeded`. `Refused`
-never counts toward the threshold: an operator saying no is policy, not a
-broken rollout (D-LAND-05).
-
-## A Deployment moves through dispatch, report and outcome
-
-```mermaid
-stateDiagram-v2
-    [*] --> Pending
-    Pending --> Dispatching: wave slot free
-    Dispatching --> Dispatched: ack of a delivery listing it, or CTF export
-    Dispatching --> Unreachable: AckTimeout (attached)
-    Dispatching --> Blocked: BridgeTooOldForBundleFormat
-    Dispatching --> Failed: WaveTimeout, ReportingLevelLowered
-    Dispatched --> Attested: matching report, Applied and Healthy
-    Dispatched --> Blocked: bridge blocking reason
-    Blocked --> Dispatched: bridge reason cleared
-    Blocked --> Dispatching: bridge upgraded
-    Dispatched --> Refused: Refused
-    Blocked --> Refused: Refused
-    Dispatched --> Failed: Failed, ReportingLevelLowered, WaveTimeout
-    Blocked --> Failed: WaveTimeout, ReportingLevelLowered
-    Pending --> Superseded: NewerPromotion
-    Dispatching --> Superseded: NewerPromotion, FencedByHistory
-    Dispatched --> Superseded: NewerPromotion
-    Blocked --> Superseded: NewerPromotion
-```
-
-- **Wave counting.** With completion `Dispatched`, reaching `Dispatched`
-  counts as done. With `Attested`, only `Attested` does. `Failed`,
-  `Unreachable`, `Refused` and `Superseded` always count. A phase change
-  after the wave counted a deployment never changes the wave result.
-- **Blocked** covers every blocking bridge reason, including
-  `AwaitingLocalAcceptance` under `updates: Manual` (D-POL-07). It counts as
-  neither complete nor failed and is bounded by the wave `timeout`, which
-  runs from `Dispatching`; for isolated landscapes it must cover export,
-  courier trip and report import.
-- **Failed** from a report means reason `Failed`: Flux has given up on a
-  `HelmRelease` ([06](06-landscape-bridge-and-policy.md)). `Progressing`
-  never fails a deployment; only the wave `timeout` does (`WaveTimeout`).
-- **Unreachable** applies to attached landscapes whose delivery is not acked
-  within the wave `ackTimeout` (default 15 min, D-PROMO-05). It frees the
-  slot, counts toward the threshold and shows separately from `Failed`. The
-  release stays desired, so the bridge pulls it on reconnect. A late ack or
-  report updates conditions and history, not the phase.
-
-## The delivery, not the Deployment, is what gets dispatched
-
-A `Deployment` is the per-landscape record for waves and the UI. The unit of
-dispatch is the landscape's signed delivery (D-BUN-04). It lists the
-landscape's full desired set: per application, a bundle by digest with
-promotion-target values and the grant ID, or a tombstone.
+## A wave step writes slots with one compare-and-set
 
 ```mermaid
 sequenceDiagram
-    participant C as promotion controller
-    participant J as delivery job (one per landscape)
+    participant W as wave step (River job)
     participant P as Postgres
+    participant D as delivery job
     participant A as API replica
     participant B as bridge
-    C->>J: Deployment enters Dispatching, enqueue for landscape
-    J->>P: allocate delivery sequence N (own transaction)
-    J->>J: live read of desired set, build and sign delivery N
-    J->>P: fence check, write dispatches + dispatch_entries, NOTIFY
-    B->>A: PlanTransfer N, FetchBlob for missing blobs
-    B->>A: Ack N
-    A->>A: patch Deployments in N's dispatch_entries to Dispatched
+    W->>P: insert rollout_targets, CAS each desired slot, insert delivery job
+    D->>P: nextval(delivery_seq), list slots, sign, set signed_at, NOTIFY
+    P->>A: NOTIFY konfidence_delivery wakes the held Sync
+    A->>B: answer: signed delivery and blob plan
+    B->>A: next Sync: statement with verified and applied sequence, entries
+    A->>P: store statement, insert wave step
+    W->>P: derive status, freeze outcomes, advance or fail the wave
 ```
 
-1. **Enqueue.** For an attached landscape the controller enqueues its
-   delivery job, unique per landscape over non-finished states, so changes
-   coalesce (D-TOPO-05). It re-enqueues while a `Dispatching` deployment has
-   no `status.delivery.sequence`.
-2. **Desired set.** The job reads `Deployment`s with a live, uncached read.
-   Per (project, application) the desired entry is the non-superseded
-   `Deployment` with the highest promotion sequence in `Dispatching` or later.
-3. **Sequence and fence.** The delivery sequence comes from
-   `landscape_sequences` in its own transaction; gaps are allowed (D-ATT-02).
-   The transaction writing `dispatches` and `dispatch_entries` checks only
-   `Deployment`s not yet in the landscape's `dispatch_entries`. It refuses one
-   whose promotion sequence is not above the last dispatched one for that
-   (application, landscape), or whose promotion is terminal in history, and
-   marks it `Superseded` with `FencedByHistory`. This is the one DB read that
-   decides (D-TOPO-07), so a restored CRD state never rolls a landscape back.
-4. **Ack.** An ack of delivery N moves the `Deployment`s in its
-   `dispatch_entries` that are still `Dispatching` to `Dispatched`.
-5. **Isolated.** The CTF export runs the same build and marks listed
-   `Dispatching` deployments `Dispatched` with `Exported` (D-UI-02).
+When a wave's gates clear, the wave step resolves the wave's selector
+against granted landscapes and inserts one `rollout_targets` row per
+landscape with no outcome. Per target it writes the slot with the
+compare-and-set from [02](02-domain-model.md): `bundle_digest` is the
+release's bundle, or NULL for a removal. In the same transaction it inserts
+the landscape's delivery job, which coalesces with any job already waiting
+(D-TOPO-05).
 
-## A report attests only the Deployment it matches
+The predicate `d.promotion_seq < excluded.promotion_seq` is the only
+supersede rule and the only fence (D-PROMO-06). Zero affected rows mean a
+higher promotion owns the slot, and the target freezes as `Superseded`. A
+newer promotion that writes the slot later turns the older target
+`Superseded` through row 2 of the status function. Older promotions never
+overwrite newer ones, so promotions cannot ping-pong. A newer promotion
+preempts an older one in flight on purpose, because it is usually a fix or a
+rollback.
 
-A verified report entry updates the current desired `Deployment` for
-(application, landscape) only if two checks pass (D-ATT-05):
+The delivery job lists only slots whose `required_capabilities` the
+landscape's latest statement has. A slot it holds back shows
+`Blocked(MissingCapability)` until the bridge upgrades or the wave times out
+(D-BUN-03).
 
-- the report's delivery sequence is at or above
-  `Deployment.status.delivery.sequence`;
-- the reported component digest equals `spec.componentDigest`.
+## Target status is derived, and only outcomes are stored
 
-The sequence check stops a report from an older delivery of the same release
-(A → B → A) from attesting the new `Deployment`. A match
-with `Applied` and `Healthy` makes it `Attested`; for `operation: Remove`,
-`Removed` does. Entries that match no current `Deployment` go to history
-only. The policy version is recorded, never compared (D-POL-06).
+The wave step evaluates the 13-row status function in
+[02](02-domain-model.md) for every open target. It runs when the wave
+starts, when a statement for one of its landscapes is imported, when a gate
+changes, and at the wave timeout. Statement import inserts the wave step for
+every promotion with an open target on that landscape, in the import
+transaction.
 
-## The newest promotion sequence owns each landscape
+A statement entry `e` matches slot `s` when both hold (rows 8 to 13):
 
-The control plane holds one desired entry per (application, landscape). Two
-rules in the leader-elected promotion controller keep it so:
+- `e.entryDigest` equals the digest of the delivery entry built from `s`;
+- `e.deliverySequence` is at or above `s.first_delivery_seq`.
 
-1. When a deployment enters `Dispatching`, every non-terminal deployment for
-   the same (application, landscape) with a lower promotion sequence becomes
-   `Superseded` with `NewerPromotion`. That includes one already
-   `Dispatched` and waiting for its report.
-2. A deployment never dispatches if one with a higher promotion sequence for
-   the same (application, landscape) already did. It becomes `Superseded`.
+A new slot write resets `first_delivery_seq`, so a statement about an older
+delivery of the same release (A, then B, then A) never matches the new
+slot. An entry that matches no slot only feeds history. The policy version
+is recorded, never compared (D-POL-06).
 
-Older promotions never touch newer ones, so promotions cannot ping-pong.
-Preempting an in-flight deployment is deliberate: a newer promotion is
-usually a fix or a rollback.
+## A wave succeeds within its failure threshold
+
+The wave step freezes a target's outcome the first time the status function
+gives a final answer:
+
+| Derived status | Frozen outcome | Counts toward the threshold |
+| --- | --- | --- |
+| `Healthy`, `Received` at level `None`, `Dispatched` on row 6 | `Succeeded` | no |
+| `Failed` | `Failed` with reason `Failed` | yes |
+| `Refused` | `Refused` | no; an operator saying no is policy (D-LAND-05) |
+| `Superseded` | `Superseded` | no |
+
+Before the timeout only a terminal Flux failure fails a target. `Blocked`,
+`Received` and `Applied` wait. At the wave timeout, measured from the moment
+the wave's gates cleared, every open target freezes as `Failed` (D-PROMO-05):
+
+- with reason `NoStatement` when no statement arrived after the first
+  delivery listing the slot was signed;
+- with reason `WaveTimeout` otherwise.
+
+The timeout of a wave with isolated landscapes covers export, the courier
+trip and statement import. When `Failed` outcomes exceed `failureThreshold`,
+the promotion turns `Failed` and no later wave starts. Slots already written
+stay; the bridges keep converging to them. When every target of a wave has
+an outcome within the threshold, the next wave's gates are seeded. After the
+last wave the promotion is `Succeeded`.
+
+A late statement updates the derived view in the UI, never a frozen outcome.
 
 ## Rollback promotes an earlier release
 
-`RollbackPromotion` (config, release, optional targets; M2+) creates an
-ordinary `Deploy` promotion of the earlier release under a new promotion
-sequence. It passes the same gates and waves; in an emergency the operator
-uses `OverrideGate`. The rollback window is the retained `Release` set of
-D-TOPO-07, and the API rejects anything outside it. Helm remediation inside a
+Rollback is an ad-hoc promotion of an earlier `Ready` release under a new
+promotion sequence (M2+). It passes the same gates and waves; in an
+emergency the operator overrides a gate. Every release stays in `releases`,
+so any earlier release can be the target. Helm remediation inside a
 landscape stays a chart-level `HelmRelease` setting.
 
-## Removal is a promotion that carries a tombstone
+## Removal is a slot that points at nothing
 
-A promotion with `operation: Remove` (M2+) has no release. Its deployments put
-a tombstone into the delivery instead of a bundle reference (D-PROMO-04).
-Gates, waves, thresholds and superseding work unchanged, and a removal
-supersedes an older deploy on the same target and the other way around.
-With completion `Attested` the bridge must report `Removed`; with
-`Dispatched` the delivery ack or export is enough.
+A removal promotion has `release_id` NULL (M2+). Its wave step writes slots
+with `bundle_digest` NULL, and the delivery carries them as tombstones
+(D-PROMO-04). Gates, waves, thresholds and the compare-and-set work
+unchanged: a removal supersedes an older deploy on the same slot and the
+other way around. A tombstone target reaches `Healthy` when the bridge
+reports `Removed`.
 
-Removal is always explicit. A landscape that drops out of a config's targets
-keeps what it runs; the config status lists it as an orphaned target, and
-`RemoveApplication` (config, targets) removes it. Deleting an `Application`
-that still runs anywhere is refused until its removals succeed or the user
-confirms abandonment. Charts dropped between releases need no tombstone; the
-bridge removes them by diffing releases ([06](06-landscape-bridge-and-policy.md)).
+Absence never removes. A landscape that leaves a config's selectors keeps
+its slot and what it runs; an ad-hoc removal narrowed to that landscape
+removes it. A new landscape that joins a selector gets the application with
+the next promotion, or with an ad-hoc promotion of the current release
+narrowed to it. Charts dropped between releases need no tombstone; the
+bridge's one reconcile removes them
+([06](06-landscape-bridge-and-policy.md)).
 
-A landscape that newly matches a config's selector gets a catch-up
-`Promotion` of `status.lastSucceeded.release` (M2+). It passes the config's
-gates: skipping approval for a new production landscape is the wrong default.
+The API refuses to delete an `Application` while any of its slots points at
+a bundle. Remove it everywhere first.
 
 ## Path
 
-1. **M1** `PromotionConfig` with a `landscapes` target list and one wave;
-   `Promotion` and `Deployment` with the state machines above; the two
-   superseding rules and the promotion sequence.
-2. **M1** Delivery job hook-up: enqueue per landscape, the fence with
-   `FencedByHistory`, ack and export moving `dispatch_entries` to
-   `Dispatched`, `ackTimeout` and `Unreachable`.
-3. **M1** Completion `Dispatched` and `Attested`, the D-ATT-05 matching rule,
-   reporting-level validation and `ReportingLevelLowered`.
-4. **M1** Gates with `(scope, type)` keys, `explicit-approval` through
-   `ApproveGate`, and `RejectPromotion`.
-5. **M2+** Selectors, multiple waves, `maxConcurrent` and `failureThreshold`
-   above one, `source.promotionConfig` chaining.
-6. **M2+** `RollbackPromotion`, `RemoveApplication` and tombstones; catch-up
-   promotions.
-7. **M2+** `OverrideGate` with audit, `soak`, the gate-writer library,
-   `SetGateState` for external writers with D-API-04 authentication.
+1. **M1** `PromotionConfig` with `source: {application}`, `mode`, and one
+   wave; `promotions` rows with the snapshot; ad-hoc promotions.
+2. **M1** Wave step: `rollout_targets`, the compare-and-set, the delivery
+   job insert, capability hold-back.
+3. **M1** Status function with its golden test, entry matching, frozen
+   outcomes, `NoStatement` and `WaveTimeout`.
+4. **M1** `SetGateState` for `explicit-approval.konfidence.cloud` and
+   `Rejected`.
+5. **M2+** Selectors over labels, several waves, thresholds above zero,
+   `source: {promotionConfig}` chaining.
+6. **M2+** Rollback, removal promotions, the `Application` delete check.
+7. **M2+** Override, `soak.konfidence.cloud`, external gate writers with
+   D-API-04 authentication.
 
 Later: pause and resume, opt-in automatic rollback on wave failure,
 cross-application ordering.

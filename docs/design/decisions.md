@@ -1,471 +1,255 @@
 # Design decisions
 
-This is the decision log for the konfidence deployment orchestrator. Every
-design document in this directory builds on it. A design document may refine a
-decision but must not contradict it; changing a decision means changing this
-file first, as a separate, stated step.
-
-Decision IDs are stable. Reference them as `D-<AREA>-<NN>`.
+The binding decisions for the konfidence deployment orchestrator, each with a
+stable ID `D-<AREA>-<NN>`. The other design docs refine them, never
+contradict them. Prior art: ADR-0006, 0007, 0019, 0027, 0032, 0039, and 0040
+in `konfidence-project/konfidence-docs`, `src/docs/extend-customize/decisions/`.
 
 ## Product boundary
 
-- **D-PROD-01** Konfidence is a standalone, enterprise-scale deployment
-  orchestrator. A central control plane delivers applications to attached
-  (connected) and isolated (air-gapped) landscapes.
-- **D-PROD-02** The vector runtime is a separate product owned by another
-  team. Its API, UI, `Stage` and `Vector` CRDs leave konfidence. Konfidence
-  imports no runtime Go types.
-- **D-PROD-03** The runtime integrates only through three contracts owned and
-  versioned by konfidence: **builders** (produce extra bundle resources from a
-  repo), **gates** (ADR-0039 model) and **status reports**. To konfidence a
-  `Stage` is another manifest in a bundle.
-- **D-PROD-04** Acceptance test for the split: konfidence deploys and promotes
-  `example-app` end to end across one attached and one isolated landscape with
-  no runtime installed. Passing it is milestone M1. `09-roadmap.md` owns the
-  milestone list and the M1 scope. Every other design doc tags each v1 step M1
-  or M2+. No doc claims the test passes on a subset of M1.
-- **D-PROD-05** Sovereign by design: pull-based, offline-capable, reporting
+- **D-PROD-01** Konfidence is a standalone deployment orchestrator. A central
+  control plane delivers applications to attached and isolated landscapes.
+- **D-PROD-02** The vector runtime is another team's product. Its API, UI,
+  `Stage` and `Vector` CRDs leave konfidence, which imports no runtime types.
+- **D-PROD-03** The runtime integrates only through three konfidence-owned
+  contracts: builders, gates (ADR-0039), and signed statements.
+- **D-PROD-04** Milestone M1 is the acceptance test: konfidence deploys and
+  promotes `example-app` across one attached and one isolated landscape with
+  no runtime installed.
+- **D-PROD-05** Delivery is pull-based and works offline; reporting is
   optional. The control plane never connects into a landscape.
 
-## Topology and scale
+## Topology and state
 
-- **D-TOPO-01** A landscape is exactly one Kubernetes cluster with exactly one
-  bridge (the landscape agent). In v1 the bridge is one Deployment with one
-  replica, `Recreate` strategy and a `coordination.k8s.io` Lease, so two
-  bridge processes never act at once. Its blob store and artifact server run
-  in that pod on one ReadWriteOnce volume. A bridge outage pauses imports,
-  reports and Flux reconciles of changed charts; running workloads are
-  unaffected. Active/passive replicas come later, if failover time becomes a
-  requirement.
+- **D-TOPO-01** A landscape is one cluster with one bridge. In v1 the bridge
+  is a single replica with `Recreate` strategy, a Lease, and one
+  ReadWriteOnce volume. A bridge outage never touches running workloads.
 - **D-TOPO-02** Target scale: 500–1000 connected landscapes.
-- **D-TOPO-03** Control-plane API replicas are stateless and scale
-  horizontally. Any replica can serve any bridge stream. State lives in
-  Postgres and Kubernetes CRDs.
-- **D-TOPO-04** Postgres is the database: history, audit, auth sessions, job
-  queue. Change notification to API replicas uses `LISTEN/NOTIFY`.
-- **D-TOPO-05** Heavy work (git fetch, builds, bundle assembly, delivery
-  preparation, CTF export) runs as River jobs (`riverqueue/river`) on
-  stateless workers. Controllers stay thin and leader-elected: they decide,
-  workers execute. No job moves bytes; the bridge pulls them from any API
-  replica. Delivery preparation and CTF export are one job per landscape,
-  unique over non-finished states only (completed excluded). Pending changes
-  coalesce, and a completed job never blocks a later change.
-- **D-TOPO-06** Bridge control streams have a bounded, jittered lifetime
-  (30 min ±10 %), enforced in the Connect handler; Connect on `net/http` has
-  no connection-age setting. The server ends the stream with `Reconnect`. The
-  bridge then dials a new TCP connection so the load balancer places it
-  again. In-flight transfer RPCs are not cut; they finish or resume by offset.
-- **D-TOPO-07** CRDs are the source of truth for desired state; reconcile
-  decisions never read the DB. History is append-only in the DB. One
-  executor fence is the stated exception: the transaction that writes a
-  dispatch record refuses a dispatch whose promotion sequence is not higher
-  than the last one dispatched for that (application, landscape), or whose
-  promotion is terminal in history. It marks that `Deployment` superseded, so
-  a restored CRD state never rolls a landscape back. A maintenance job prunes
-  CRs to one rule:
-  - per (application, landscape): the active `Deployment`, the last
-    successful one and the last terminal one;
-  - a terminal `Promotion` only while it owns a retained `Deployment`;
-  - a `Release` while a retained `Deployment`, an active `Promotion` or a
-    `PromotionConfig`'s last succeeded release references it, plus the 5 with
-    the highest sequence number per application.
+- **D-TOPO-03** API replicas are stateless. Any replica answers any bridge.
+- **D-TOPO-04** Postgres holds every fact: releases, promotions, gate states,
+  desired slots, deliveries, statements, events, audit, sessions, and River.
+  One `NOTIFY` kind, "delivery changed", wakes the held `Sync` calls.
+- **D-TOPO-05** One binary runs in the modes `api`, `worker`, and `signer`.
+  Every River job commits in the transaction that causes it. Controller-runtime
+  only writes intent CRD status. No job moves bytes. Each landscape has one
+  delivery job, unique over unfinished states, so changes coalesce.
+- **D-TOPO-07** Intent lives in CRDs, facts live in Postgres. The CRDs are
+  `Project`, `Landscape`, `LandscapeGrant`, `GitCredential`, `Application`,
+  and `PromotionConfig`. Informers read them; Postgres never copies them. An
+  ad-hoc promotion is an API call that writes a row.
 
-  The retained `Release` set is the rollback window. Everything older lives
-  only in Postgres.
-
-## Sources, credentials, releases
+## Sources and releases
 
 - **D-SRC-01** Only the control plane reads git. No git credential reaches a
   landscape or a bundle.
-- **D-SRC-02** Supported credentials: GitHub PAT, SSH deploy key, GitHub App.
-  github.com only; no GitHub Enterprise Server for now (adding a base URL later
-  is additive).
-- **D-SRC-03** `GitCredential` CRD, project-scoped, with `type` and a
-  `secretRef` to a Kubernetes Secret. Key material never enters the DB.
-  Credentials can be granted to other projects.
-- **D-SRC-04** SSH requires a pinned `known_hosts`; no TOFU for git hosts.
-  PAT expiry is surfaced as a status condition before syncs fail.
-- **D-SRC-05** Change detection polls by default; GitHub App webhooks only
-  accelerate.
-- **D-SRC-06** An `Application` (control plane) consists of one or more git
-  sources, each with its own `credentialRef`.
-- **D-REL-01** A release ID is a hash over a canonical line serialization
-  (format `konfidence.cloud/release-id/v1`, not protobuf) of three inputs:
-  - the snapshotted commit list (normalized repo URL + path + SHA, sorted by
-    source name);
-  - the digests of the vendored dependency archives (OCI manifest digest for
-    `oci://`);
-  - one `layout` line: the SHA-256 of the RFC 8785 canonical JSON of the
-    build- and deploy-relevant `Application` spec (charts, values file paths,
-    `dependsOn`, CRD policy, overridable keys, secret requirements, builders
-    and their config).
+- **D-SRC-02** GitHub PAT, SSH deploy key, or GitHub App; github.com only.
+- **D-SRC-03** A project owns each `GitCredential` and can grant it to other
+  projects. Key material stays in a Kubernetes Secret, never in the DB.
+- **D-SRC-04** SSH requires a pinned `known_hosts`. PAT expiry shows early.
+- **D-SRC-05** Change detection polls. GitHub App webhooks only accelerate.
+- **D-SRC-06** An `Application` has 1..n git sources, each with a `credentialRef`.
+- **D-REL-01** A release is its build-input manifest: one canonical JSON
+  document of commits, dependency digests, and the deploy-relevant
+  `Application` spec. The release ID is its SHA-256. A release diff is a
+  manifest diff.
+- **D-REL-02** The component digest names the bytes, the release ID names the
+  inputs. A per-application sequence (`payments-api@42`) is the human label.
+- **D-REL-03** The API shows release diffs, which landscape runs which
+  release, and each release's path through promotions and waves.
 
-  Equal release ID means equal deployable inputs. The controller creates a
-  `Release` only for a release ID the application does not have yet. Builder
-  image versions are not inputs; they affect only the component digest
-  (D-REL-02).
-- **D-REL-02** The component version digest (bytes) is a separate identity
-  from the release ID (sources). A per-application sequence number
-  (`payments@42`) is the human-facing label.
-- **D-REL-03** APIs visualize releases: diff between releases, which
-  landscape runs which release (with values and policy digests), the path of a
-  release through promotions and waves.
+## Bundles, deliveries, and transfer
 
-## Bundles and transfer
-
-- **D-BUN-01** A bundle is a signed OCM component version. Primary content is
-  Helm charts. Chart dependencies are vendored at build time
-  (`helm dependency build`); public OCI is reached only by the build, never by
-  a landscape.
-- **D-BUN-02** Bundle from the first deployment on. Every landscape, including
-  the first connected one, receives a bundle. No direct git sync to landscapes.
-- **D-BUN-03** The bundle/CTF format carries its own integer major version,
-  independent of the API version. Each bundle is built in exactly one major. A
-  control-plane release that introduces a new major keeps building the
-  previous one until an admin raises the emitted major. Readability is checked
-  per application. A release whose major the bridge cannot read is held back
-  for that application only; the landscape's other applications and
-  tombstones still deliver.
-- **D-BUN-04** A delivery is a small signed OCM component version per
-  landscape (`konfidence.cloud/l/<landscape>/delivery`, version
-  `<delivery sequence>.0.0`). It lists the landscape's full desired set: per
-  application a bundle reference by digest, promotion-target values and
-  tombstones, plus the CRL. It is the unit of dispatch. A dispatch record in
-  Postgres lists the `Deployment`s each delivery covers. An ack or export of
-  delivery N moves exactly those `Deployment`s to Dispatched.
-- **D-XFER-01** gRPC is the primary transfer path, initiated by the bridge.
-  Each landscape has exactly one credential: the bridge identity. CTF archives
-  are the offline path. Both use the same content-addressed blob layout and
-  the same verify-and-unpack code on the bridge.
-- **D-XFER-02** OCI is not a transfer mechanism. The orchestrator-local
-  registry is storage behind the control plane, never a protocol landscapes
-  use.
-- **D-XFER-03** gRPC transfers are chunked, resumable and content-addressed.
-  The bridge reports its blob inventory; only missing blobs travel. The blob
-  inventory is mandatory, not an optimization.
-- **D-XFER-04** Images land in one landscape registry that the operator
-  provides and the nodes already pull from. The operator configures it at
-  bridge install: endpoint, optional CA bundle, and a push credential in a
-  Secret on the landscape. That credential never leaves the landscape and is
-  not a control-plane credential (D-XFER-01). `ApplicationPolicy` image mode
-  decides transfer content per application at transfer time:
-  - **Full** (default): the transfer carries image blobs, and the bridge
-    pushes them under a per-project path in the landscape registry.
-  - **Thin**: no image blobs travel; the bridge checks that every digest
-    already exists in the landscape registry.
-
-  Without a configured landscape registry the bridge applies no application
-  that has images and reports `RegistryNotConfigured`. Konfidence ships no
-  registry.
-- **D-XFER-05** Offline, the operator exports one **state request file** per
-  trip from the bridge. It carries bridge version and capabilities, blob
-  inventory, the transfer-relevant part of application policies, the last
-  applied delivery sequence and the signed attestation reports the control
-  plane has not yet acknowledged. One upload imports those reports and
-  requests the next CTF. Without a state request file, the CTF is a full
-  transfer.
-- **D-XFER-06** The bridge rewrites image references to where images landed
-  in the landscape registry, pinned by digest, via a Flux `HelmRelease`
-  post-renderer (kustomize `images`). Konfidence never changes node or
-  containerd configuration. Nodes resolving, trusting and pulling from the
-  landscape registry is the operator's cluster setup, the same setup the
-  bridge's own images need.
+- **D-BUN-01** A bundle is a signed OCM component version of Helm charts with
+  vendored dependencies. Only the build reaches public OCI.
+- **D-BUN-02** Every landscape receives bundles from the first deployment on.
+  No landscape syncs from git.
+- **D-BUN-03** Capabilities are the only compatibility primitive. Statements
+  list the bridge's capabilities; bundles declare the ones they require. A
+  format major is a capability (`bundle.v1`). One comparison function blocks
+  the wave step, holds back the one application (`MissingCapability`) by
+  leaving its entry out of the delivery, and drives the outdated-bridge view.
+- **D-BUN-04** A delivery is a signed OCM component version per landscape,
+  versioned by delivery sequence. It lists every desired slot of the
+  landscape and carries the CRL.
+- **D-XFER-01** The bridge pulls over gRPC with one credential, its identity.
+  CTF archives are the offline path. Both share the blob layout and the
+  verify-and-unpack code.
+- **D-XFER-02** The blob store is the only control-plane storage for bytes.
+  Landscapes never talk to it directly.
+- **D-XFER-03** Transfers are content-addressed and resume by offset. Each
+  statement carries the blob inventory, or its digest when unchanged. Only
+  missing blobs travel.
+- **D-XFER-04** Images land in a registry the operator provides on the
+  landscape; konfidence ships none. Its push credential never leaves the
+  landscape. Policy image mode `Full` (default) transfers and pushes images.
+  `Thin` transfers none and checks that every digest exists.
+- **D-XFER-05** Offline moves the same two messages as online. The state
+  request file holds a statement, and the CTF holds an answer plus its blobs.
+  An export without a statement plans every blob.
+- **D-XFER-06** A Flux post-renderer pins image references to the landscape
+  registry by digest. Konfidence never changes node or containerd config.
 
 ## Landscape side
 
-- **D-LAND-01** Flux is the only deployment engine. The bridge serves chart
-  artifacts in-cluster and publishes them as Flux `ExternalArtifact`
-  (`source.toolkit.fluxcd.io/v1`, feature gate `ExternalArtifact=true` on
-  helm-controller and kustomize-controller), consumed by
-  `HelmRelease.spec.chartRef`. The bridge installs a pinned Flux or adopts an
-  existing one after checking the feature gate.
-- **D-LAND-02** Bridge-side CRDs: cluster-scoped `Application` (installed
-  application), `ApplicationPolicy`, `Boundary`. They are the bridge's API and
-  follow versioned-CRD compatibility rules.
-- **D-LAND-03** A landscape `Application` is 1..n charts, each a `HelmRelease`
-  ordered by `dependsOn` and readiness. CRDs come through the chart `crds/`
-  directory with an explicit install/upgrade CRD policy. **No data flow
-  between charts** (no outputs feeding values, no cross-chart templating) —
-  that is runtime territory. No cross-application ordering in v1.
-- **D-LAND-04** Ownership: the cluster-scoped `Application` owns its
-  `HelmRelease`s and `ExternalArtifact`s. The `Boundary` owns namespaces,
-  never the `Application`. Helm keeps CRDs and StatefulSet PVCs on uninstall;
-  this is the documented default.
-- **D-LAND-05** If an operator deletes an `Application` CR locally the bridge
-  recreates it from the last bundle. Refusing an application is done through
-  `ApplicationPolicy` deny, shown to the control plane as "refused by
-  landscape".
-- **D-LAND-06** The bridge CLI talks to a bridge admin endpoint. The endpoint
-  authenticates callers with Kubernetes TokenReview and authorizes each
-  operation with SubjectAccessReview on `bridgeoperations.konfidence.cloud`
-  verbs. Bridge keys never leave the bridge process. No operator task needs
-  `exec` into the bridge or read access to its Secrets.
+- **D-LAND-01** Flux is the only deployment engine. The bridge serves charts
+  as Flux `ExternalArtifact`s. It installs a pinned Flux or adopts one.
+- **D-LAND-02** Bridge-side CRDs: cluster-scoped `Application`,
+  `ApplicationPolicy`, `Boundary`. They are the bridge's versioned API.
+- **D-LAND-03** A landscape `Application` is 1..n charts, each a
+  `HelmRelease`, ordered by `dependsOn`. No data flows between charts. No
+  cross-application ordering in v1.
+- **D-LAND-04** The `Application` owns its `HelmRelease`s and
+  `ExternalArtifact`s; the `Boundary` owns namespaces. Helm keeps CRDs and
+  PVCs on uninstall.
+- **D-LAND-05** The bridge recreates a locally deleted `Application`. An
+  operator refuses an application through policy deny, reported as `Refused`.
+- **D-LAND-06** The bridge CLI calls an admin endpoint guarded by TokenReview
+  and SubjectAccessReview. Bridge keys never leave the bridge process.
 
 ## Policy and tenancy
 
-- **D-POL-01** `ApplicationPolicy` belongs to the landscape operator and is
-  authoritative on the landscape. It controls: what may be deployed
-  (allow/deny), target namespace, value overrides, secret bindings, image
-  rules (thin/full, registry allow-list, required signatures), reporting
-  level. A landscape-wide default plus per-application policies.
-- **D-POL-02** Value precedence: chart defaults < application < promotion
-  target < landscape policy. Applications declare overridable keys (values
-  schema + allow-list). Attestations carry a digest of effective values, never
-  the values.
-- **D-POL-03** Secrets: bundles declare secret requirements (name, keys);
-  policies bind them to local stores (ESO `SecretStore` or plain Secret).
-  Unbound requirements block the deployment with a clear status. Secrets never
-  pass through the control plane.
-- **D-POL-04** Policies select applications by label. Labels under
-  `konfidence.cloud/` (`project`, `application`, `landscape-grant`) are set
-  only by the bridge, from the verified bundle identity and the delivery
-  (D-TEN-02); such labels in a bundle are dropped. A policy matches only
-  applications inside its own `Boundary`. At most one policy per application
-  besides the default; two matches is an "ambiguous policy" error, never a
-  merge.
-- **D-POL-05** Reporting level per application: `none | health | resources`.
-  - `health`: application state (Applied, Refused, Blocked, Removed) plus one
-    aggregated health per application and chart.
-  - `resources`: `health` plus, per applied resource, group, kind, namespace,
-    name, `Ready` status, reason, message (truncated to 1 KiB) and observed
-    generation.
+- **D-POL-01** `ApplicationPolicy` belongs to the landscape operator and wins
+  on the landscape. It sets allow/deny, namespace, value overrides, secret
+  bindings, image rules, and the reporting level.
+- **D-POL-02** Values: chart < application < promotion target < landscape
+  policy. Statements carry a digest of effective values, never the values.
+- **D-POL-03** Bundles declare secret requirements; policies bind them to
+  local stores. Secrets never pass through the control plane.
+- **D-POL-04** Policies select by label. Only the bridge sets the
+  `konfidence.cloud/` labels. A policy matches only inside its own
+  `Boundary`. Two matching policies are an error, never a merge.
+- **D-POL-05** Reporting level per application: `None` (name and level only),
+  `Health`, or `Resources`. No resource `status` subtree leaves a landscape.
+  The level takes effect at runtime, with no check at config save. A gate
+  that needs missing data stays pending until the wave timeout.
+- **D-POL-06** Release plus policy version identify what runs. The bridge
+  computes the policy version. The control plane records it and never
+  compares it.
+- **D-POL-07** Under `updates: Manual` the bridge stores deliveries but
+  applies a changed entry, tombstones included, only after the operator
+  accepts it locally. `Manual` on the default policy brakes the landscape.
+- **D-TEN-01** A `LandscapeGrant` declares that a project may use a
+  landscape. The landscape admin approves it by writing a `Boundary`. Until
+  then the bridge stores the project's entries and reports
+  `WaitingForBoundaryApproval`. The bridge creates namespaces, quota, and a
+  deployer ServiceAccount per tenant. Cluster-scoped kinds, CRDs, and webhooks
+  always need admin approval.
+- **D-TEN-02** Grant identity is the project UID. The API mints it with the
+  `Project` and never changes it. The bridge stamps it as
+  `konfidence.cloud/project`, and a `Boundary` names exactly one.
+- **D-TEN-03** The deployer ServiceAccount gets a konfidence-defined Role,
+  never `edit` or `admin`. The Role excludes Flux and konfidence kinds and
+  the `bind`, `escalate`, and `impersonate` verbs.
 
-  No resource `status` subtree leaves a landscape. Promotion-config validation
-  rejects gates and completion rules a target landscape cannot satisfy at its
-  level; gate entries may declare `requiresReporting: health | resources`. A
-  lowered level at runtime makes gates fail closed with an explicit reason.
-- **D-POL-06** Deployment identity = release + policy version. The policy
-  version is the SHA-256 of the canonical effective policy for the
-  application, computed by the bridge. Reports also carry the contributing
-  policy refs `<name>@<generation>` for display. The control plane records the
-  policy version and never compares it against an expected value, because
-  policy is authoritative on the landscape.
-- **D-POL-07** Update acceptance per application:
-  `ApplicationPolicy.spec.updates: Auto | Manual`, default `Auto`. Under
-  `Manual` the bridge verifies and stores deliveries. It applies a changed
-  release or a tombstone for that application only after the landscape
-  operator accepts that exact component digest or tombstone sequence locally
-  (`konfidence-bridge accept`). Until then the application keeps its applied
-  release and reports `AwaitingLocalAcceptance`. `Manual` on the landscape
-  default policy is the landscape-wide brake. The control plane can never
-  accept on the operator's behalf.
-- **D-TEN-01** Landscape sharing: a project requests access, the landscape
-  admin defines a `Boundary`, the application policy works inside it, the
-  bridge enforces.
-  - Automated: namespaces from template, a deployer ServiceAccount and Role
-    per tenant (D-TEN-03), ResourceQuota, and `serviceAccountName` on every
-    `HelmRelease` the bridge writes.
-  - Flux multi-tenancy lockdown flags (`--no-cross-namespace-refs`,
-    `--default-service-account`, `--no-remote-bases`) are set only when the
-    bridge installs Flux. On adopted Flux the bridge reports
-    `FluxLockdown=False` and keeps rendering, because tenants get no rights on
-    Flux kinds.
-  - Always manual admin approval: cluster-scoped kinds, CRDs, webhooks, and
-    namespaced kinds outside the base set.
+## Trust and statements
 
-  "Waiting for boundary approval" is its own status. It is derived from the
-  bundle's build-time metadata; tenant RBAC is the hard guard for anything
-  that appears only with landscape values.
-- **D-TEN-02** Each `LandscapeGrant` carries a random grant ID, minted by the
-  API at creation and immutable. The delivery carries it per application; the
-  bundle does not. The bridge stamps it as `konfidence.cloud/landscape-grant`.
-  A `Boundary` names exactly one grant ID and matches on it only; project and
-  grant names are display only. A deleted and recreated grant or project gets
-  a new ID, and the landscape admin must update the `Boundary` again.
-- **D-TEN-03** The deployer ServiceAccount is bound to a konfidence-defined
-  Role in its `Boundary`'s namespaces. It is never bound to the built-in
-  `edit` or `admin` ClusterRoles, which aggregate Flux and third-party kinds.
-  The Role covers a fixed base set of namespaced kinds plus namespaced kinds
-  the `Boundary` approves. It never includes `*.toolkit.fluxcd.io` or
-  `landscape.konfidence.cloud` kinds, or the `bind`, `escalate` and
-  `impersonate` verbs. The bridge refuses bundles containing Flux or
-  konfidence kinds with `OutsideBoundary`.
+- **D-TRUST-01** Trust on first use, both ways: the bridge pins the control
+  plane's signing key, the control plane pins the bridge identity key.
+- **D-TRUST-02** Both sides compute an enrollment code from landscape ID and
+  both key fingerprints. Neither side trusts the other until a human confirms
+  the code. Skipping needs an audited reason.
+- **D-TRUST-03** A new control-plane key needs the pinned key's signature.
+  After a compromise every operator re-pins locally with an out-of-band
+  fingerprint. The control plane can never trigger a re-pin.
+- **D-TRUST-04** An optional customer CA replaces pinning. Every delivery
+  carries the CRL, and operators can import one locally.
+- **D-TRUST-05** Statement import checks a deny list of revoked bridge keys.
+- **D-TRUST-06** Only the `signer` mode holds the signing key. It runs the
+  isolated `signing` queue and re-hashes every blob before it signs.
+- **D-ATT-01** A statement is the bridge's only message to the control plane,
+  signed with the bridge identity key. It carries the statement sequence,
+  capabilities, inventory, last verified and applied delivery sequence, and
+  per application what the reporting level allows.
+- **D-ATT-02** Two counters only rise. The control plane allocates the
+  delivery sequence and never reuses one; the bridge rejects anything at or
+  below its last applied delivery. The bridge allocates the statement
+  sequence per bridge key; the highest one under the landscape's pinned key
+  counts, older ones become history. Every answer returns the last accepted
+  statement sequence and the bridge raises its counter above it, so a bridge
+  restored from backup recovers on its next sync.
+- **D-ATT-04** After a Postgres restore, the runbook restarts the delivery
+  sequence 1000 above the highest one any bridge reports.
 
-## Trust and attestation
+## Promotion, rollout, and removal
 
-- **D-TRUST-01** Trust on first use by default, mutual: the bridge pins the
-  control plane's release-signing key, the control plane pins the bridge
-  identity key.
-- **D-TRUST-02** At enrollment both sides compute an enrollment code: 16
-  base32 characters of SHA-256 over landscape ID, control-plane key
-  fingerprint and bridge key fingerprint. The bridge pins the control-plane
-  key only after the landscape operator confirms the code locally. The control
-  plane keeps the bridge key `Unconfirmed` until a `landscape-admin` enters the
-  code the bridge printed. Until then it dispatches nothing to that landscape
-  and imports no attestation from it. Skipping the comparison is explicit on
-  either side, needs a reason, and is audited and shown in the UI.
-- **D-TRUST-03** Rotation: a new control-plane key is accepted only if signed
-  by the pinned key. This covers planned rotation only, because whoever holds
-  a compromised key can sign a transition too. Recovery from a control-plane
-  key compromise is a local re-pin on every bridge (`trust repin`); the
-  control plane can never trigger it. Bridge enrollment and `trust repin`
-  accept an expected control-plane key fingerprint obtained out of band
-  (`--cp-key-fingerprint`). With it the bridge pins only that key, and its side
-  of the comparison needs no control-plane UI.
-- **D-TRUST-04** Optional customer CA replaces pinning. With an offline root
-  it is the recommended setup when a security office must be able to revoke
-  control-plane keys. Revocation uses a CRL carried in every delivery,
-  including CTF, and importable locally on the bridge (`trust crl import`),
-  because a compromised control plane can withhold a CRL. Isolated landscapes
-  are only as fresh as their last transfer; documented, not hidden.
-- **D-TRUST-05** Revoked bridge keys go on a deny list checked at attestation
-  import.
-- **D-TRUST-06** Signing-key custody: only the signing worker Deployment holds
-  the release-signing key. It runs the `signing` River queue, with egress
-  limited to Postgres, the blob store and the Kubernetes API. It re-hashes
-  every resource blob before it signs a bundle or delivery. Processes that
-  fetch git, run helm or builders, or reach public registries never hold the
-  key. Enrollment responses are not signed; the enrollment code comparison
-  (D-TRUST-02) authenticates them.
-- **D-ATT-01** Offline attestation is required. The bridge signs reports with
-  its identity key, binding landscape ID, release digest, per-resource status,
-  effective values digest, policy version and the report sequence (D-ATT-02).
-  Reports arrive over gRPC or as an imported file and are processed by the
-  same code.
-- **D-ATT-02** Two monotonic per-landscape counters guard freshness, each
-  owned by its writer.
-  - The delivery sequence (lseq) is allocated only by the control plane, in
-    Postgres, in its own committed transaction. A failed attempt leaves a
-    gap and never reuses a number; gaps are allowed. CRD fields only mirror
-    it. It travels in every signed delivery. The bridge rejects a delivery
-    that is not higher than its last applied one. Equal lseq with a different
-    digest raises an alarm.
-  - The report sequence is allocated by the bridge and travels in every
-    report. The control plane rejects a report at or below the last accepted
-    one.
-
-  Freshness never relies on wall-clock time.
-- **D-ATT-03** Counters recover upward only. Every handshake response and
-  every delivery carries the control plane's delivery floor and its last
-  accepted report sequence. The bridge sets its delivery floor to the maximum
-  of its state Secret, the highest verified delivery in its store and the
-  received floor. It raises its report counter above the accepted value and
-  never lowers either counter. A bridge restored from backup therefore
-  recovers on the next connect or delivery, without re-enrollment. A
-  regressed report from a valid key sets the Landscape condition
-  `BridgeStateRegressed` instead of failing silently.
-- **D-ATT-04** After a Postgres restore, lseq restarts at max(restored value,
-  highest lseq reported by any bridge) + 1000. A number signed before the
-  restore, including one in a CTF a courier still holds, is never reissued.
-- **D-ATT-05** A report's application entry updates the current desired
-  `Deployment` for (application, landscape) only if two checks pass: the
-  report's delivery sequence is at or above the lseq that first carried that
-  `Deployment`, and the reported component digest equals the `Deployment`'s.
-  That `Deployment` is Attested when the entry reports Applied and Healthy.
-  Entries that match no current `Deployment` go to history only.
-
-## Promotion, rollout, removal
-
-- **D-PROMO-01** Gates follow ADR-0039 (inline `status.gates`, type-agnostic
-  controller, external writers, override = setting a gate satisfied with
-  audit). `VectorPromotion` becomes `Promotion` over a `Release`.
-- **D-PROMO-02** Fan-out: a promotion targets a set of landscapes (list or
-  selector), creates one `Deployment` record per landscape and rolls out in
-  waves with `maxConcurrent` and a failure threshold. Gates at promotion level
-  and optionally per wave.
-- **D-PROMO-03** Each wave has an explicit per-landscape completion rule:
-  `attested` or `dispatched`. Landscapes at reporting level `none` can only use
-  `dispatched`.
-- **D-PROMO-04** Removal: a tombstone in the signed delivery (D-BUN-04)
-  removes a whole application from a landscape. Tombstones go through the
-  same promotion, gate and wave path. Charts removed from an application
-  between releases are removed by diffing releases.
-- **D-PROMO-05** In a wave, an attached landscape that does not acknowledge
-  its delivery within the wave's `ackTimeout` (default 15 min) ends its
-  `Deployment` as `Unreachable`. Unreachable frees the `maxConcurrent` slot,
-  counts toward `failureThreshold` and is shown separately from `Failed`. The
-  release stays desired, and the landscape pulls it on reconnect. A late
-  arrival is recorded on the `Deployment` without changing the wave result.
-  Only a terminal Flux failure or the wave timeout makes a `Deployment`
-  `Failed`; `Progressing` never does.
+- **D-PROMO-01** Gates keep ADR-0039 semantics. Every gate write is
+  `SetGateState(promotion, wave, type, state, reason)`: approval, external
+  writer, audited override, and reject. `Rejected` ends the promotion.
+- **D-PROMO-02** A promotion is a release or a removal, plus a snapshot of
+  its config's ordered waves. A wave is a landscape selector with gates, a
+  failure threshold, and a timeout. Waves are the only concurrency unit.
+- **D-PROMO-03** A target is one landscape in one wave. Its status derives
+  from the slot and the bridge's current statement. Dispatched means a
+  delivery lists the slot. Received, Applied, Healthy, Blocked, and Refused
+  come from the statement. Superseded means a higher promotion owns the slot.
+  A target succeeds at Healthy, or at Received if the entry reports `None`.
+  For a landscape with `spec.statements: None`, Dispatched is final.
+- **D-PROMO-04** Removal is a slot that points at nothing. Its wire form is a
+  tombstone, a delivery entry with an empty bundle reference. Absence from a
+  delivery never deletes. The bridge runs one reconcile per application.
+- **D-PROMO-05** Before the wave timeout only a terminal Flux failure fails a
+  target. At the timeout, a target without a statement since dispatch ends as
+  `NoStatement`, and other open targets end as Failed. Both count toward the
+  threshold. The rollout stores only frozen outcomes.
+- **D-PROMO-06** Every landscape has one desired slot per application. A wave
+  step writes it with one compare-and-set on promotion sequence. That
+  predicate is the only supersede rule and the only fence. Rollback promotes
+  an older release under a new sequence.
 
 ## API and UI
 
-- **D-API-01** One protobuf schema served with Connect (connectrpc): gRPC for
-  bridges, HTTP/JSON for browser and CLI.
-- **D-API-02** Compatibility because bridges are upgraded manually by
-  operators (no self-update): `buf breaking` in CI, additive changes only
-  within `v1`, field numbers never reused, capability negotiation at
-  handshake, stated minimum bridge version, outdated bridges visible in the UI.
-- **D-API-03** The API authorizes (OIDC session in Postgres, project, grants)
-  and writes CRDs. The UI uses only the public API and never the Kubernetes
-  API.
-- **D-API-04** (M2+) Machine callers of `konfidence.api.v1` authenticate with
-  short-lived OIDC tokens. Trust rules on `Project` or `Landscape` map
-  (issuer, audience, claim match) to a role. GitHub Actions and Kubernetes
-  projected ServiceAccount tokens use the same rule type. The issuer's keys
-  are configured statically on the rule or fetched from an issuer URL outside
-  any landscape; the control plane never fetches keys from a landscape. No
-  long-lived API tokens. A gate's `setBy` is `<issuer>#<sub>`.
-- **D-API-05** `konfidence.bridge.v1` has exactly one service,
-  `BridgeService`, with five RPCs:
-  - `Enroll`: unary, enrollment token.
-  - `Connect`: bidirectional control stream for handshake, delivery notices,
-    acks and `Reconnect`.
-  - `PlanTransfer`: unary, full blob inventory.
-  - `FetchBlob`: server stream, resumable by offset.
-  - `SubmitReport`: unary, one signed report.
+- **D-API-01** One protobuf schema served with Connect: gRPC for bridges,
+  HTTP/JSON for browser and CLI.
+- **D-API-02** Operators upgrade bridges by hand, so `v1` only grows. A
+  stated minimum bridge version and capabilities (D-BUN-03) cover the rest.
+- **D-API-03** The API authorizes every call and writes intent CRDs and
+  Postgres rows. The UI uses only the public API.
+- **D-API-04** (M2+) Machine callers use short-lived OIDC tokens through
+  trust rules. No long-lived API tokens.
+- **D-API-05** `BridgeService` has three RPCs: `Enroll`, `Sync`, and
+  `FetchBlob`. `Sync` takes a statement and holds the call until the
+  delivery changes or a timeout passes. Its answer carries the signed
+  delivery and the blob plan.
+- **D-UI-01** The UI uses Svelte, Skeleton, and `konfidence-design-system`
+  (restored from commit `fdff305`).
+- **D-UI-02** The UI separates dispatched, attested at T, and live. It never
+  shows an isolated landscape as plainly healthy.
+- **D-UI-03** Deep links come only from URL templates on the `Landscape`. No
+  UI plugin system in v1.
 
-  Files a courier carries go through `konfidence.api.v1.OfflineService`.
-- **D-API-06** `02-domain-model.md` is the only definition of names other docs
-  depend on: CRD fields, status enums and reason strings, Postgres tables and
-  the `LISTEN/NOTIFY` channel. `01-control-plane.md` owns River job kinds and
-  queues; `08-api-and-ui.md` owns proto names and the only proto sketch. Topic
-  docs reference these and carry no YAML or proto sketches of their own. CRD
-  enum values are PascalCase; proto enums use the prefixed UPPER_SNAKE form
-  and map 1:1.
-- **D-UI-01** The UI is built from the start: Svelte, Skeleton and
-  `konfidence-design-system` (product-neutral, restored from commit `fdff305`).
-- **D-UI-02** The UI distinguishes *dispatched*, *attested at T* and *live*.
-  Isolated landscapes are never shown as plainly healthy.
-- **D-UI-03** Runtime resources appear as generic resource status from
-  attestations. Deep links come from URL templates per group and kind, set on
-  the `Landscape` by its landscape-admin. Bundle content never supplies link
-  targets. No UI plugin system in v1.
+## Changes after simplification (2026-10-29)
 
-## Prior art
-
-The previous konfidence design lives in
-`konfidence-project/konfidence-docs` under
-`src/docs/extend-customize/decisions/`. Relevant: ADR-0006 (OCM
-integration), ADR-0007 (multi-landscape), ADR-0019 (OCM vector assembly),
-ADR-0027 (landscape deployment target), ADR-0032 (vector promotions),
-ADR-0039 (promotion gates), ADR-0040 (promotion rejection and force
-execution).
-
-## Changes after review (2026-10-29)
-
-- D-PROD-04: passing the test is M1; `09-roadmap.md` owns the milestone list.
-- D-TOPO-01: v1 bridge is a single pod with a Lease; active/passive comes later.
-- D-TOPO-05: no job moves bytes; one coalescing delivery job per landscape.
-- D-TOPO-06: stream lifetime enforced in the Connect handler, not `MaxConnectionAge`.
-- D-TOPO-07: one CR retention rule; dispatch fence in Postgres as the only DB read.
-- D-REL-01: release ID adds a `layout` line over the deploy-relevant spec.
-- D-BUN-03: format major checked per application.
-- D-BUN-04 (new): per-landscape signed delivery is the dispatch unit.
-- D-XFER-04: images land in an operator-provided registry; konfidence ships none.
-- D-XFER-05: one state request file per trip, carrying unacknowledged reports.
-- D-XFER-06: konfidence never changes node or containerd configuration.
-- D-LAND-06 (new): bridge CLI uses an admin endpoint with TokenReview and SubjectAccessReview.
-- D-POL-04: grant label comes from the delivery, not the bundle.
-- D-POL-05: reporting levels capped at `none | health | resources` with fixed contents.
-- D-POL-06: policy version defined as a bridge-computed hash, recorded, never compared.
-- D-POL-07 (new): per-application manual update acceptance on the landscape.
-- D-TEN-01: tenant RBAC replaces Flux lockdown as the hard guard.
-- D-TEN-02 (new): grants have minted IDs; one grant per `Boundary`.
-- D-TEN-03 (new): konfidence-defined deployer Role without Flux or konfidence kinds.
-- D-TRUST-02: enrollment code confirmed on both sides before trust counts.
-- D-TRUST-03: compromise recovery is a local re-pin with an out-of-band fingerprint.
-- D-TRUST-04: CRL rides in every delivery and is importable locally.
-- D-TRUST-06 (new): signing key lives only in an isolated signing worker.
-- D-ATT-01: reports carry the report sequence.
-- D-ATT-02: two counters, delivery sequence and report sequence, each owned by its writer.
-- D-ATT-03 (new): counters recover upward only; handshake and delivery carry floors.
-- D-ATT-04 (new): lseq restarts 1000 above the highest known value after a Postgres restore.
-- D-ATT-05 (new): rule for matching report entries to `Deployment`s.
-- D-PROMO-04: tombstones travel in the delivery.
-- D-PROMO-05 (new): unacknowledged attached landscapes end as `Unreachable`.
-- D-API-04 (new, M2+): machine callers use short-lived OIDC tokens via trust rules.
-- D-API-05 (new): one `BridgeService` with five RPCs.
-- D-API-06 (new): name ownership across 02, 01 and 08.
-- D-UI-03: deep links come only from landscape URL templates.
+- D-PROD-04: milestone ownership and M-tags moved to the README.
+- D-TOPO-04: Postgres holds every fact; one `NOTIFY` kind wakes held `Sync` calls.
+- D-TOPO-05: one binary with modes `api`, `worker`, and `signer`.
+- D-TOPO-06: retired with the bridge streams.
+- D-TOPO-07: intent in six CRDs, facts in Postgres; no retention rule or fence exception.
+- D-REL-01: release ID is the digest of one build-input manifest.
+- D-BUN-03: capabilities replace format majors.
+- D-BUN-04: the delivery lists slots; no dispatch records.
+- D-XFER-02: the blob store is the only control-plane byte storage.
+- D-XFER-03: the statement carries the inventory, as a digest when unchanged.
+- D-XFER-05: the state request file holds a statement, the CTF an answer.
+- D-POL-04: no `landscape-grant` label.
+- D-POL-05: reporting level takes effect at runtime; no config-save check.
+- D-POL-07: the operator accepts an entry, tombstones included.
+- D-TEN-01: the `Boundary` is the grant approval.
+- D-TEN-02: grant identity is the project UID.
+- D-TRUST-06: the signer is a mode of the one binary.
+- D-ATT-01: the signed statement replaces reports, handshake, and state file.
+- D-ATT-02: older statements go to history instead of rejection.
+- D-ATT-03: retired; no floors, no regression condition.
+- D-ATT-04: reduced to one runbook rule.
+- D-ATT-05: retired; entry matching moved to 05-promotion-and-rollout.md.
+- D-PROMO-01: one `SetGateState` call; `Rejected` is a gate state.
+- D-PROMO-02: waves are the only concurrency unit; no `maxConcurrent`.
+- D-PROMO-03: status derives from slot and statement; no completion-rule field.
+- D-PROMO-04: removal is a slot that points at nothing.
+- D-PROMO-05: `NoStatement` at wave timeout replaces `ackTimeout`.
+- D-ATT-02: statement sequence per bridge key; answers return the accepted sequence.
+- D-PROMO-03: `Landscape.spec.statements: None` makes Dispatched final.
+- D-PROMO-06 (new): desired slot with compare-and-set on promotion sequence.
+- D-API-02: capabilities replace handshake negotiation.
+- D-API-03: the API writes intent CRDs and Postgres rows.
+- D-API-05: three RPCs `Enroll`, `Sync`, and `FetchBlob`.
+- D-API-06: retired; name ownership moved to the README.

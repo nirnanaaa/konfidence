@@ -1,46 +1,34 @@
 # Bundles and transfer
 
-This page defines the bundle a release becomes, the delivery that lists what
-a landscape runs, and how their bytes reach the bridge over gRPC or in a CTF
-archive. It ends where Flux takes over. Policy checks are in
-[06](06-landscape-bridge-and-policy.md), and keys and reports are in
-[04](04-trust-and-attestation.md). Names come from [02](02-domain-model.md),
-job kinds from [01](01-control-plane.md), and RPC messages from
+This page owns the bundle and delivery layout, the verify order, and the one
+exchange that moves both: a statement goes in, an answer comes out, over
+`Sync` or as files. It ends where Flux takes over. The statement payload is
+in [04](04-trust-and-attestation.md), slot writes in
+[05](05-promotion-and-rollout.md), policy checks in
+[06](06-landscape-bridge-and-policy.md), names in [02](02-domain-model.md),
+job kinds in [01](01-control-plane.md), and proto names in
 [08](08-api-and-ui.md).
 
-## Target design
+## A release becomes one bundle, a slot change one delivery
 
-### A release becomes one bundle, a landscape change one delivery
+| Object | OCM component | Version | Signed |
+| --- | --- | --- | --- |
+| Bundle | `konfidence.cloud/p/<project>/<application>` | `<release seq>.0.0` | once per release |
+| Delivery | `konfidence.cloud/l/<landscape ID>/delivery` | `<delivery seq>.0.0` | once per change to the landscape's slots |
 
-The control plane signs a bundle once per release. Per-landscape facts
-cannot live in it, because the delivery sequence differs per landscape
-(D-ATT-02). They go into a second, small signed component version: the
-delivery (D-BUN-04).
-
-| Object | OCM component | Version | Built | Content |
-| --- | --- | --- | --- | --- |
-| Bundle | `konfidence.cloud/p/<project>/<application>` | `<sequence>.0.0` | once per `Release` | charts, image references, values schema, secret requirements, metadata |
-| Delivery | `konfidence.cloud/l/<landscape ID>/delivery` | `<delivery sequence>.0.0` | per landscape, per change | full desired set, tombstones, CRL |
-
-The version form assumes OCM requires semver (unverified). The release ID is
-a signed label.
-
-The delivery references each bundle through an OCM component reference with
-its digest. The OCM signature covers reference digests
-([OCM signing](https://ocm.software/docs/concepts/signing-and-verification/)),
+The version form assumes OCM requires semver (unverified). The delivery
+references each bundle by digest, and the OCM signature covers reference
+digests ([OCM signing](https://ocm.software/docs/concepts/signing-and-verification/)),
 so one check on the delivery pins every bundle it names. Each bundle keeps its
-own signature, so either side can verify and cache it alone.
+own signature, so either side can verify and cache it alone. A delivery
+lists every slot of the landscape, never a delta. The bridge
+applies only a delivery above its last applied sequence. A lost delivery
+causes no drift, and two CTFs imported out of order resolve to the newer one.
 
-The delivery is declarative: it lists the landscape's full desired set, never
-a delta. The bridge applies only a delivery above its last applied sequence.
-A lost delivery causes no drift. Two CTFs imported out of order resolve to the
-newer one.
+### The bundle carries what is equal on every landscape
 
-### The bundle carries everything that is equal on every landscape
-
-The bundle holds every resource by value (OCM `localBlob`), except images,
-which stay OCI artifacts. Names are stable, so release diffs (D-REL-03)
-compare like with like.
+Every resource is a `localBlob` except images. Stable names keep release
+diffs like for like (D-REL-03).
 
 | Resource | OCM type | Content |
 | --- | --- | --- |
@@ -48,219 +36,152 @@ compare like with like.
 | `image.<chart>.<n>` | `ociImage` | image manifest or index, by digest |
 | `values-schema.<chart>` | `konfidence.cloud/values-schema/v1` | JSON Schema plus overridable keys (D-POL-02) |
 | `secret-requirements` | `konfidence.cloud/secret-requirements/v1` | name, keys, consuming chart (D-POL-03) |
-| `metadata` | `konfidence.cloud/bundle-metadata/v1` | per chart: `dependsOn`, CRD policy, cluster-scoped kinds, CRDs, webhooks, images, and image value paths |
-| `builder.<builder>.<n>` | declared by the builder | builder output (contract in [07](07-sources-and-releases.md)) |
+| `metadata` | `konfidence.cloud/bundle-metadata/v1` | per chart: `dependsOn`, CRD policy, cluster-scoped kinds, CRDs, webhooks, images, image value paths |
+| `builder.<builder>.<n>` | declared by the builder | builder output ([07](07-sources-and-releases.md)) |
 
-The bundle signs the labels `konfidence.cloud/bundle-format`, `release-id`,
-`project` and `application` (`signing: true`). `metadata` lets the bridge decide
-`WaitingForBoundaryApproval` and `UnboundSecret` before it creates any
-`HelmRelease` (D-TEN-01). Tenant RBAC catches kinds that appear only with
-landscape values (D-TEN-03).
+The bundle signs the labels `konfidence.cloud/release-id`, `project`,
+`application` and `required-capabilities`. The last equals
+`releases.required_capabilities`; in M1 it is `bundle.v1`, which covers the
+bundle and delivery layout on this page (D-BUN-03). `metadata` lets the
+bridge decide `WaitingForBoundaryApproval` and `UnboundSecret` before it
+creates any `HelmRelease` (D-TEN-01).
 
-### The delivery carries everything that differs per landscape
+### The delivery carries what differs per landscape
 
-| Resource | OCM type | Content |
-| --- | --- | --- |
-| `manifest` | `konfidence.cloud/delivery/v1` | landscape ID, delivery sequence, last accepted report sequence, format major; per application: bundle reference, promotion-target values, grant ID; tombstones |
-| `crl` | `konfidence.cloud/crl/v1` | current revocation list (D-TRUST-04), empty in `Pinned` mode |
+The delivery has two resources. `manifest` (`konfidence.cloud/delivery/v1`)
+holds the landscape ID, the delivery sequence, and one entry per slot. `crl`
+(`konfidence.cloud/crl/v1`) holds the newest revocation list, empty in
+`Pinned` mode (D-TRUST-04). An entry holds the project UID, the application, release ID and label, the
+bundle reference, and the slot's values. A tombstone has an empty release
+and bundle reference (D-PROMO-04). The bridge echoes each entry digest in its
+statement, and `accept` takes it (D-POL-07). An application missing from a
+delivery keeps what it runs; only a tombstone removes. A slot held back for
+`MissingCapability` is missing in exactly this way.
 
-The grant ID travels here, because one bundle serves many grants (D-TEN-02).
-The bridge stamps it as `konfidence.cloud/landscape-grant`. A tombstone names
-an application and the delivery sequence that removes it (D-PROMO-04). An
-application that leaves the desired set without a tombstone is a
-control-plane bug: the bridge keeps it running and reports the mismatch. The
-last accepted report sequence lets a restored bridge raise its counter
-(D-ATT-03).
+## The signer signs what the blob store holds
 
-### One worker builds, another worker signs
+`release.build` runs in `worker` mode without the signing key (D-TRUST-06).
+It packages each chart with vendored dependencies at the pinned SHAs, runs
+the builders, finds images and cluster-scoped kinds with `helm template`,
+and copies images by digest into the blob store (D-XFER-02). `bundle.sign`
+in `signer` mode re-hashes every blob, signs the descriptor, and sets
+`releases.bundle_digest`. Signatures use OCM's default `RSASSA-PSS` and
+exclude `access`, so blobs move between blob store, CTF, and bridge store
+unchanged.
 
-The build job runs on a build worker. It reaches git and public registries
-and never holds the signing key (D-TRUST-06).
+`delivery.build` also runs in `signer` mode, one per landscape;
+[01](01-control-plane.md#one-delivery-job-per-landscape-builds-signs-and-announces)
+owns its steps.
 
-1. Check out every source at its pinned SHA (D-SRC-01). Per chart, run
-   `helm dependency build` against `Chart.lock` and `helm package`.
-2. Run configured builders and collect their output as resources.
-3. Run `helm template` with chart defaults to find images, cluster-scoped
-   kinds, CRDs, and webhooks. The application's image list adds images that
-   need non-default values. Resolve tags to digests and copy each image into
-   the control-plane blob store (D-XFER-02).
-4. Upload all blobs and an unsigned component descriptor.
+## One blob layout serves gRPC and CTF
 
-The signing job re-hashes every resource blob from the blob store, signs the
-descriptor and writes the digest to `Release.status.component`. It signs what
-the blob store holds, not what the build worker claims. Signatures use OCM's
-default `RSASSA-PSS` with `jsonNormalisation/v4alpha1`. They exclude
-`access`, so blobs can move between the blob store, a CTF, and the bridge store.
-
-### The delivery job builds one delivery per landscape change
-
-The per-landscape delivery job runs on the signing worker. It is unique per
-landscape over non-finished states, so pending changes coalesce (D-TOPO-05).
-
-1. Allocate the next delivery sequence in its own committed transaction. A
-   failed run leaves a gap (D-ATT-02).
-2. List the landscape's `Deployment`s with a live API read. Per application,
-   take the non-superseded one with the highest promotion sequence in
-   `Dispatching` or later. Build, sign, and push the delivery.
-3. In one transaction, write `dispatches` and `dispatch_entries`, pass the
-   dispatch fence (D-TOPO-07) and send `NOTIFY dispatch:<landscape ID>`.
-
-An ack of delivery N moves exactly the `Deployment`s in its
-`dispatch_entries` to `Dispatched` (D-BUN-04). The format major in `konfidence.cloud/bundle-format` is independent of the
-API version (D-BUN-03). Changes within a major are additive. The build writes
-each bundle in exactly one major. The bridge advertises the majors it reads
-in `Hello` and in the state request file. If a bridge can't read the major of
-an application's target release, the job keeps that application at its last
-readable release, with `BridgeTooOldForBundleFormat` on its `Deployment`.
-Every other application and every tombstone still deliver.
-
-### gRPC and CTF share one content-addressed blob layout
-
-Every byte that crosses to a landscape is a blob named by its SHA-256:
-descriptors, chart `.tgz` files, schemas, OCI manifests, configs, and layers.
-Images travel as their OCI blobs, so a base layer shared by twenty images
-travels once.
-
-The layout is the OCM CTF directory format: `artifact-index.json` and a
-`blobs/` directory with files named `sha256.<hex>`
+Every byte that crosses to a landscape is a blob named by its SHA-256, image
+layers included, so a shared base layer travels once. The layout is the OCM
+CTF directory format: `artifact-index.json` and `blobs/sha256.<hex>`
 ([CTF spec](https://github.com/open-component-model/ocm-spec/blob/main/doc/04-extensions/03-storage-backends/ctf.md)).
-A CTF archive is that layout as a `tar` file, and the bridge store is that
-layout as a directory. The gRPC transfer exposes it blob by blob.
+A CTF is that layout as a `tar` file, the bridge store is that layout as a
+directory, and `FetchBlob` serves it blob by blob. `Sync` and CTF import
+share one digest-checked import and the verify-and-unpack step (D-XFER-01).
 
-The bridge has one import routine. Blobs land in `incoming/`, the bridge
-checks each digest, moves the blob to `blobs/` and merges the index. gRPC and
-CTF import both call it, then the same verify-and-unpack step (D-XFER-01).
+The store lives on the bridge's RWO volume (D-TOPO-01). After each apply it
+keeps the blobs of every applied release, of the newest verified delivery,
+and of the 3 applied deliveries before it. GC removes the rest.
 
-The store lives in the bridge pod on one RWO volume (D-TOPO-01). After each
-apply it keeps the blobs of every applied release, of the newest verified
-delivery, and of the 3 applied deliveries before it. GC removes the rest, and
-the next inventory is exactly what remains. A bridge outage pauses imports,
-reports and reconciles of changed charts; running workloads keep running.
+## Sync takes a statement and answers with the newest delivery
 
-### The bridge pulls only the blobs it lacks
-
-The bridge opens every connection (D-PROD-05). Any API replica serves any
-transfer and holds no transfer state (D-TOPO-03). The RPCs are those of
-`BridgeService` (D-API-05).
+The bridge opens every call (D-PROD-05). Any stateless API replica answers.
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant S as signing worker
+    participant S as signer
     participant BS as blob store
+    participant P as Postgres
     participant A as API replica
     participant B as bridge
     participant F as Flux
+    B->>A: Sync(Statement: verified N-1, inventory digest)
+    Note over A: nothing newer: hold
     S->>BS: signed delivery N
-    S->>A: NOTIFY dispatch:<landscape ID>
-    A-->>B: Connect: DeliveryAvailable(N)
-    B->>A: PlanTransfer(N, full inventory, profile)
-    A-->>B: delivery descriptor + missing blobs (digest, size)
+    S->>P: commit delivery N + NOTIFY
+    P-->>A: konfidence_delivery(landscape ID)
+    A-->>B: Answer(delivery N, blob plan)
     loop each missing blob, 4 parallel
         B->>A: FetchBlob(digest, offset)
-        A->>BS: range read
-        A-->>B: 1 MiB chunks
+        A-->>B: 1 MiB chunks from the blob store
     end
     B->>B: import, verify, store
-    B-->>A: Connect: Ack(N)
     B->>F: ExternalArtifact + HelmRelease
-    B->>A: SubmitReport (see 04)
+    B->>A: Sync(Statement: verified N, applied N, entries)
 ```
 
-- **Inventory.** The bridge sends its full, sorted inventory with every plan
-  (D-XFER-03). 10 000 blobs make about 700 KB of digest strings. No table
-  stores inventory or progress.
-- **Resume.** After a cut, `FetchBlob` restarts at the partial file's size.
-  A `Reconnect` (D-TOPO-06) never cuts a running `FetchBlob`.
+- **Hold.** The API imports the statement ([04](04-trust-and-attestation.md))
+  and answers or holds the call by the rules in
+  [01](01-control-plane.md#api-replicas-hold-sync-calls-without-owning-state).
+  The repeated statement is the heartbeat (`last_seen_at`).
+- **Blob plan.** The statement carries the full inventory after an import or
+  GC changed it, and its digest otherwise (D-XFER-03). Against a full
+  inventory the plan lists the missing blobs. Against a digest it lists every
+  blob the delivery references, and the bridge skips those it holds. Image
+  blobs of applications whose transfer profile says `Thin` stay out. No table
+  stores an inventory.
+- **Acknowledgement.** The next statement's delivery sequences are the only
+  one; the status function reads them (D-PROMO-03).
+- **Resume.** `FetchBlob` restarts at the partial file's size. A newer
+  answer mid-transfer replaces the plan, and fetched blobs carry over.
 - **Back-pressure.** Each API replica serves at most 50 concurrent
-  `FetchBlob` streams. Above that it answers `resource_exhausted` with a
-  retry delay. The bridge waits that delay plus full jitter. Enrollment and
-  waves bound fleet onboarding, so 1000 bridges never join at once.
-- **Supersede.** On a higher `DeliveryAvailable` mid-transfer, the bridge
-  plans the new delivery. Finished and partial blobs carry over; GC drops the
-  partial ones the new plan doesn't need.
-- **Ack.** The bridge acks a delivery once it has verified and stored it.
-  Apply results arrive in reports. A delivery applies atomically, so a small
-  fix waits for every blob of every changed application in it.
+  `FetchBlob` streams and answers `resource_exhausted` with a retry delay
+  above that. The bridge waits that delay plus full jitter.
 
-### The transfer profile picks image blobs per application
+A delivery applies atomically, so a small fix waits for every blob of every
+changed application in it.
 
-The bridge sends a transfer profile in `PlanTransfer` and in the state request
-file. Per application, it holds `ApplicationPolicy.spec.images.transfer` and
-whether a landscape registry is configured. The control plane uses it only to
-select blobs and never evaluates landscape policy.
+## Images go to the operator's registry
 
-Images land in one landscape registry the operator provides and the nodes
-already pull from (D-XFER-04). The operator sets endpoint, optional CA bundle
-and a push credential in a Secret at bridge install. That credential never
-leaves the landscape. Konfidence ships no registry and never changes node or
-containerd configuration (D-XFER-06). Without a configured registry, the
-bridge applies no application with images and reports `RegistryNotConfigured`.
+The statement's transfer profile holds, per application, the policy's
+`images.transfer` and whether a landscape registry exists. The control plane
+uses it only to plan blobs. The operator sets registry endpoint, CA bundle,
+and push credential at bridge install; the credential never leaves the
+landscape (D-XFER-04). Under `Full` (default, M1) image blobs travel, and the
+bridge pushes them to `<registry>/<prefix>/<project>/<application>/<image>`.
+Under `Thin` (M2+) none travel, and the bridge checks that every digest
+exists at that path. Without a registry the bridge applies no application
+with images and reports `RegistryNotConfigured`.
 
-- **Full** (default, M1): the plan carries image blobs. The bridge pushes them
-  to `<registry>/<prefix>/<project>/<application>/<image>`.
-- **Thin** (M2+): no image blobs travel. The bridge checks that every digest
-  exists at that same path.
+## Offline moves the same statement and answer as files
 
-### One state request file goes out and one CTF comes in per trip
+An isolated landscape gets deliveries signed like any other; only the
+carrier differs (D-XFER-05).
 
-Isolated landscapes use the same import, verify and unpack code (D-XFER-05).
+1. The operator runs `konfidence-bridge state export`. The state request file
+   is one signed statement with the full inventory.
+2. The operator uploads it to `OfflineService` through UI or CLI. The API
+   imports the statement as `Sync` does and returns a signed download URL.
+   A `GET` on it streams the CTF of the answer and its planned blobs
+   ([08](08-api-and-ui.md#the-offline-service-takes-a-statement-file-and-returns-a-ctf)).
+3. The operator runs `konfidence-bridge ctf import <file>`.
 
-1. The operator runs `konfidence-bridge state export`. The bridge signs the
-   state request file with its identity key. The file holds bridge version and
-   capabilities, readable format majors, landscape ID, last applied delivery
-   sequence, blob inventory, transfer profile, and the signed reports the
-   control plane has not acknowledged.
-2. The operator uploads it through the UI or CLI (`ImportStateRequest`). The
-   API imports its reports as `SubmitReport` does and inserts `ctf.export`.
-3. The CTF export job runs the delivery job's steps for the landscape. It
-   packs the delivery, its bundle descriptors, the CRL and every missing blob.
-   Listed `Deployment`s move to `Dispatched` with reason `Exported`.
-4. The operator runs `konfidence-bridge ctf import <file>`.
+A CTF exported without a state request file plans every blob. Scanning
+stations check a CTF with stock `ocm verify`.
 
-Without a state request file the CTF holds every blob of the desired set. A
-report-only trip uses the separate attestation export. The bridge CLI reaches
-the bridge through its admin endpoint and needs no `exec` or Secret access
-(D-LAND-06). Scanning stations check a CTF with stock `ocm verify`.
-
-### The bridge verifies, then unpacks, then hands over to Flux
+## The bridge verifies, then unpacks, then hands over to Flux
 
 Verification stops at the first failure:
 
-1. The delivery signature is valid under the pinned control-plane key, or the
-   customer CA in M2+ (D-TRUST-01, D-TRUST-04).
+1. The delivery signature is valid under the pinned control-plane key, or
+   the customer CA in M3 (D-TRUST-01, D-TRUST-04).
 2. The landscape ID is this landscape's. The delivery sequence is above the
    last applied one; an equal sequence with another digest raises an alarm.
 3. The CRL is at least as new as the stored one and keeps the signing key.
-4. Each bundle descriptor matches its reference digest and its own signature,
-   and each blob matches its digest.
+4. Each bundle matches its reference digest and its own signature, and each
+   blob matches its digest.
 
-The bridge persists the delivery sequence, raises its report counter
-(D-ATT-03) and acks. After the policy checks in
-[06](06-landscape-bridge-and-policy.md), it unpacks per application:
-
-- **Charts.** The bridge serves each chart over in-cluster HTTP. One
-  `ExternalArtifact` per chart, in the target namespace, carries
-  `status.artifact` with `url`, `digest` and revision
-  `<chart>-<version>@sha256:<hex>`
-  ([ExternalArtifact](https://fluxcd.io/flux/components/source/externalartifacts/)).
-- **HelmRelease.** One per chart, `spec.chartRef` to that `ExternalArtifact`,
-  helm-controller with `--feature-gates=ExternalArtifact=true`
-  ([HelmRelease](https://fluxcd.io/flux/components/helm/helmreleases/)). The
-  bridge `Application` owns both (D-LAND-04).
-- **Images.** One `postRenderers[].kustomize.images` entry per image sets
-  `newName` and `digest` (D-XFER-06). kustomize `images` rewrites container
-  fields only (unverified). For images in env vars, args or custom resources,
-  the bridge sets the value path named in `metadata`.
-
-## Interfaces other docs depend on
-
-- This page owns the delivery manifest layout, the verify order and the
-  semantics of `PlanTransfer`, `FetchBlob` and the `Connect` notices.
-  [08](08-api-and-ui.md) owns their proto names.
-- [06](06-landscape-bridge-and-policy.md) reads bundle `metadata`. Inputs
-  come from [05](05-promotion-and-rollout.md) (`Deployment`s) and
-  [07](07-sources-and-releases.md) (builders, image lists).
+The bridge persists the delivery sequence before it hands anything to Flux.
+After the policy checks in [06](06-landscape-bridge-and-policy.md), it serves
+each chart as an [ExternalArtifact](https://fluxcd.io/flux/components/source/externalartifacts/)
+behind one `HelmRelease` `spec.chartRef`, with helm-controller run as
+`--feature-gates=ExternalArtifact=true`. A `kustomize.images` post-renderer
+pins each image by digest (D-XFER-06); it rewrites container fields only
+(unverified), so other image fields use the value paths in `metadata`.
 
 ## Path
 
@@ -268,33 +189,21 @@ The bridge persists the delivery sequence, raises its report counter
 
 1. **M1** Spike: a chart `.tgz` as `ExternalArtifact` behind `chartRef` on
    kind. This settles the artifact format.
-2. **M1** Build and signing jobs for `example-app`, checked with `ocm verify`.
-3. **M1** Delivery job: sequence from `landscape_sequences`, `manifest`,
-   empty `crl`, dispatch records and `NOTIFY`.
-4. **M1** Bridge store, import and verify-and-unpack, fed by CTF import for
-   the isolated landscape.
-5. **M1** `PlanTransfer`, `FetchBlob` and the 50-stream cap for the attached
-   landscape.
-6. **M1** Full mode against an operator registry, with the `kustomize.images`
-   post-renderer. CI kind clusters run a local registry with kind's
-   documented containerd config; that is test harness, not konfidence.
-7. **M1** State request file with reports, driving the CTF export.
-8. **M2+** Thin mode, tombstones and the format-major hold-back.
+2. **M1** Build, signing and delivery jobs for `example-app`, with tombstone
+   entries and the `MissingCapability` hold-back, checked with `ocm verify`.
+3. **M1** Bridge store, import, verify-and-unpack, and tombstone handling,
+   fed by CTF import.
+4. **M1** `Sync` with hold and blob plan, `FetchBlob`, Full mode against an
+   operator registry, and the offline files.
+5. **M2+** Thin mode.
 
-### Later
-
-- Per-application apply: an application applies once its blobs are complete.
-  Reports then carry the applied delivery sequence per application.
-- Admin-set emitted format major with a fleet view of readable majors.
-- Incremental inventory above about 100 000 blobs per landscape.
-- A fleet transfer budget and a separate blob-serving process, if the
-  simulator shows pressure.
-- Image signature checks, CTF volume splitting, and a courier drop folder.
+Later: per-application apply, incremental inventory above about 100 000
+blobs, image signature checks, and CTF volume splitting.
 
 ## Open questions
 
 1. Does helm-controller accept a packaged chart `.tgz` as `ExternalArtifact`
    content, or a tarball of the chart directory? Path step 1 answers it.
 2. Does the OCM Go library write an `ociImage` into a CTF as separate OCI
-   blobs or as one tarball? If one tarball, konfidence writes image blobs into
-   the CTF index itself to keep layer deduplication.
+   blobs or as one tarball? If one tarball, konfidence writes image blobs
+   into the CTF index itself to keep layer deduplication.
